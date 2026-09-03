@@ -1,0 +1,35 @@
+[project]
+enable_telemetry = false
+session_timeout = 3600
+user_session_timeout = 1296000
+cache = false
+allow_origins = ["*"]
+
+[features]
+unsafe_allow_html = false
+latex = false
+auto_tag_thread = true
+edit_message = true
+
+[features.spontaneous_file_upload]
+enabled = true
+max_files = 5
+max_size_mb = 20
+
+[UI]
+name = "Nikki"
+description = "Nikki — private AI assistant"
+default_theme = "dark"
+layout = "default"
+cot = "full"
+custom_css = "/public/nikki.css"
+
+[[UI.header_links]]
+    name = "Spaces"
+    display_name = "Spaces Gallery"
+    icon_url = "/public/spaces.svg"
+    url = "/spaces"
+    target = "_self"
+
+[meta]
+generated_by = "2.12.0"

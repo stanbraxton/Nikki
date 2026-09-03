@@ -1,0 +1,5 @@
+.venv
+data
+.secrets
+.env
+__pycache__

@@ -1,0 +1,15 @@
+chainlit>=2.6
+fastapi
+uvicorn[standard]
+langgraph>=0.6
+langchain-core
+langchain-anthropic
+langchain-openai
+langgraph-checkpoint-postgres
+langgraph-checkpoint-sqlite
+psycopg[binary,pool]
+sqlalchemy[asyncio]
+asyncpg
+aiosqlite
+bcrypt
+python-dotenv

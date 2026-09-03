@@ -1,0 +1,2 @@
+:root { --primary: #7c5cff; }
+#header .watermark, a[href*="chainlit"] { display: none !important; }
