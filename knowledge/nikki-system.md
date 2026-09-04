@@ -7,6 +7,12 @@ operating manual.
 ## Stack
 - **UI**: Chainlit 2.x mounted at `/` inside a FastAPI app (`app/main.py`, `app/ui.py`). Real-time token streaming,
   expandable reasoning/tool steps, approval gates (Approve/Reject) before gated tools run.
+- **Changing my own UI**: I CAN edit my own interface. The chat UI is Chainlit, customized via `.chainlit/config.toml`
+  (`[[UI.header_links]]` = top-header links, currently Integrations + Schedules), `public/nikki.js` (admin-only Admin/Spaces
+  links injected into the top header, signup link on /login) and `public/nikki.css`. The other pages (/admin, /spaces,
+  /integrations, /schedules, /signup) are plain HTML in `app/`. Workflow: edit + commit + push to `stanbraxton/Nikki`
+  main, then tell Stan the change is committed and needs a redeploy of the `nikki` Cloud Run service (I cannot redeploy
+  myself). Never tell Stan a UI change is impossible.
 - **Agent**: LangGraph ReAct agent (`app/agent.py`), default model `anthropic:claude-sonnet-4-5`, switchable to
   OpenAI in settings. Graph is rebuilt from the tool registry after every interrupt so hot-loaded skills bind.
 - **Tools** (`app/tools/`): files (workspace-sandboxed), db_schema/db_query/db_execute, self-maintenance
