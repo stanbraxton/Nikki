@@ -554,6 +554,9 @@ def _cloud_build_errors(cb_id: str) -> str:
     r = subprocess.run([gcloud_bin(), "builds", "log", cb_id, "--region", region(), "--project", project() or ""],
                        capture_output=True, text=True, timeout=120)
     lines = [ln for ln in (r.stdout or "").splitlines() if ln.strip()]
+    if not lines:
+        err = (r.stderr or "").strip().splitlines()[-3:]
+        return "(no log lines returned; needs roles/logging.viewer on the runtime service account) " + " | ".join(err)
     errs = [ln for ln in lines if re.search(r"error|failed|✖|ERROR|not found|Cannot", ln)]
     return "\n".join((errs or lines)[-40:])
 

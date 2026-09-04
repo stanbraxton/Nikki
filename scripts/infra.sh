@@ -119,7 +119,7 @@ curl -s -X POST -H "Authorization: Bearer $TOK" -H "x-goog-user-project: $PROJEC
 PROJECT_NUMBER=$(gcloud projects describe "$PROJECT" --format="value(projectNumber)")
 BUILD_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:${BUILD_SA}" --role roles/firebasehosting.admin -q >/dev/null
-for role in roles/secretmanager.admin roles/firebasehosting.admin; do
+for role in roles/secretmanager.admin roles/firebasehosting.admin roles/logging.viewer; do
   gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:${RUNTIME_SA}" --role "$role" -q >/dev/null
 done
 gcloud secrets describe GITHUB_TOKEN --project "$PROJECT" >/dev/null 2>&1 || printf '\n' | gcloud secrets create GITHUB_TOKEN --data-file=- --project "$PROJECT"
