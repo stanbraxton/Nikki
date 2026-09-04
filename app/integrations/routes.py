@@ -224,10 +224,10 @@ async def admin_page() -> HTMLResponse:
 
 
 def _page(title: str, body: str) -> str:
-    return f"""<!doctype html><html><head><meta charset="utf-8"><title>{title} · Nikki</title>
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>{title} · Nikki</title><link rel="icon" type="image/png" href="/public/favicon.png"><link rel="apple-touch-icon" href="/public/apple-touch-icon.png">
 <style>body{{margin:0;background:#0f1014;color:#e8e9f0;font:15px/1.6 -apple-system,Segoe UI,Inter,sans-serif;display:grid;place-items:center;height:100vh}}
 .card{{background:#171922;border:1px solid #262a38;border-radius:14px;padding:28px 32px;max-width:520px}}h1{{font-size:18px;margin:0 0 10px}}a{{color:#c9bdff}}</style></head>
-<body><div class="card"><h1>{title}</h1><p>{body}</p><p><a href="/integrations">← Integrations</a> · <a href="/">Nikki</a></p></div></body></html>"""
+<body><div class="card"><h1><img src="/public/avatars/nikki.png" alt="" style="width:34px;height:34px;border-radius:50%;vertical-align:middle;margin-right:10px">{title}</h1><p>{body}</p><p><a href="/integrations">← Integrations</a> · <a href="/">Nikki</a></p></div></body></html>"""
 
 
 _BASE_CSS = """
@@ -250,8 +250,8 @@ table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:8px 10px;
 """
 
 INTEGRATIONS_HTML = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Integrations · Nikki</title><style>{_BASE_CSS}</style></head><body>
-<header><h1>🔌 Integrations</h1><span class="muted" id="who"></span><nav style="margin-left:auto"><a href="/">Chat</a><a href="/schedules">Schedules</a><a href="/admin" id="adminlink" style="display:none">Admin</a></nav></header>
+<title>Integrations · Nikki</title><link rel="icon" type="image/png" href="/public/favicon.png"><link rel="apple-touch-icon" href="/public/apple-touch-icon.png"><style>{_BASE_CSS}</style></head><body>
+<header><h1><img src="/public/avatars/nikki.png" alt="" style="width:34px;height:34px;border-radius:50%;vertical-align:middle;margin-right:10px">Integrations</h1><span class="muted" id="who"></span><nav style="margin-left:auto"><a href="/">Chat</a><a href="/schedules">Schedules</a><a href="/admin" id="adminlink" style="display:none">Admin</a></nav></header>
 <main><p class="muted">Connect the services Nikki may use on your behalf. Credentials are encrypted and only used for actions you ask for; anything that sends or creates content still asks for your approval.</p>
 <div class="grid" id="grid"></div></main><div class="toast" id="toast"></div>
 <script>
@@ -285,8 +285,8 @@ load();if(new URLSearchParams(location.search).get('connected'))toast('Connected
 </script></body></html>"""
 
 ADMIN_HTML = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Admin · Nikki</title><style>{_BASE_CSS}</style></head><body>
-<header><h1>🛠 Admin</h1><nav style="margin-left:auto"><a href="/">Chat</a><a href="/integrations">Integrations</a><a href="/schedules">Schedules</a><a href="/spaces">Spaces</a></nav></header>
+<title>Admin · Nikki</title><link rel="icon" type="image/png" href="/public/favicon.png"><link rel="apple-touch-icon" href="/public/apple-touch-icon.png"><style>{_BASE_CSS}</style></head><body>
+<header><h1><img src="/public/avatars/nikki.png" alt="" style="width:34px;height:34px;border-radius:50%;vertical-align:middle;margin-right:10px">Admin</h1><nav style="margin-left:auto"><a href="/">Chat</a><a href="/integrations">Integrations</a><a href="/schedules">Schedules</a><a href="/spaces">Spaces</a></nav></header>
 <main><h2 style="font-size:16px">Provider registrations</h2><p class="muted">One-time developer app registration per OAuth provider. Once saved here, every tenant can connect with one click. Secrets are stored encrypted.</p>
 <div class="grid" id="prov"></div>
 <h2 style="font-size:16px;margin-top:34px">Tenants</h2><table id="tenants"><thead><tr><th>Tenant</th><th>Name</th><th>Plan</th><th>Status</th><th>Accounts</th><th>Created</th><th>Actions</th></tr></thead><tbody></tbody></table>
@@ -294,7 +294,7 @@ ADMIN_HTML = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><met
 <script>
 const $=s=>document.querySelector(s);function toast(m){{const t=$('#toast');t.textContent=m;t.style.display='block';setTimeout(()=>t.style.display='none',3500)}}
 function esc(s){{return String(s??'').replace(/[&<>"]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c]))}}
-async function load(){{const r=await fetch('/api/admin/providers');if(r.status===401){{location.href='/login';return}}if(r.status===403){{document.body.innerHTML='<main><h1>Admin only</h1></main>';return}}
+async function load(){{const r=await fetch('/api/admin/providers');if(r.status===401){{location.href='/login';return}}if(r.status===403){{document.body.innerHTML='<main><h1><img src="/public/avatars/nikki.png" alt="" style="width:34px;height:34px;border-radius:50%;vertical-align:middle;margin-right:10px">Admin only</h1></main>';return}}
  const d=await r.json();const g=$('#prov');g.innerHTML='';
  for(const p of d.providers){{const el=document.createElement('div');el.className='card';
   el.innerHTML=`<h2>${{esc(p.name)}} ${{p.configured?'<span class="chip ok">Configured ('+p.configured+')</span>':'<span class="chip warn">Not configured</span>'}}</h2>

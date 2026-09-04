@@ -70,7 +70,7 @@ async def spaces_slash():
 
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Spaces · Nikki</title>
+<title>Spaces · Nikki</title><link rel="icon" type="image/png" href="/public/favicon.png"><link rel="apple-touch-icon" href="/public/apple-touch-icon.png">
 <style>
 :root{--bg:#0f1014;--card:#171922;--line:#262a38;--text:#e8e9f0;--muted:#8b90a5;--primary:#7c5cff;--ok:#2fbf71;--bad:#ff5c72;--warn:#f5b342}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,Segoe UI,Inter,Roboto,sans-serif}
@@ -90,7 +90,7 @@ main{max-width:1180px;margin:0 auto;padding:28px}
 .empty{color:var(--muted);text-align:center;padding:40px 20px}.sect{font-size:15px;font-weight:600;margin:6px 0 14px;color:var(--text)}.sub{color:var(--muted);font-weight:400;font-size:12.5px;margin-left:8px}.empty b{color:var(--text)}
 details{font-size:12px;color:var(--muted)}pre{white-space:pre-wrap;font-size:11px;background:#0c0d12;padding:8px;border-radius:8px;max-height:160px;overflow:auto}
 </style></head><body>
-<header><h1>Spaces Gallery</h1><a href="/">← Back to Nikki</a></header>
+<header><h1><img src="/public/avatars/nikki.png" alt="" style="width:34px;height:34px;border-radius:50%;vertical-align:middle;margin-right:10px">Spaces Gallery</h1><a href="/">← Back to Nikki</a></header>
 <main><h2 class="sect">Apps <span class="sub">full projects · GitHub → Cloud Build → Firebase Hosting</span></h2><div id="apps" class="empty">Loading…</div>
 <h2 class="sect">Micro-Spaces <span class="sub">single-file apps on Cloud Run</span></h2><div id="root" class="empty">Loading…</div></main>
 <script>

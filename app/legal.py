@@ -12,8 +12,8 @@ line-height:1.6;color:#e6e6e6;background:#111}h1{font-size:1.6rem}a{color:#8ab4f
 
 def _page(title: str, body: str) -> HTMLResponse:
     return HTMLResponse(f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · Nikki</title>{_STYLE}</head>
-<body><h1>{title}</h1>{body}<p><a href="/">← Back to Nikki</a></p></body></html>""")
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · Nikki</title><link rel="icon" type="image/png" href="/public/favicon.png"><link rel="apple-touch-icon" href="/public/apple-touch-icon.png">{_STYLE}</head>
+<body><h1><img src="/public/avatars/nikki.png" alt="" style="width:34px;height:34px;border-radius:50%;vertical-align:middle;margin-right:10px">{title}</h1>{body}<p><a href="/">← Back to Nikki</a></p></body></html>""")
 
 
 @router.get("/privacy", response_class=HTMLResponse, include_in_schema=False)
