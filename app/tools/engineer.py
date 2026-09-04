@@ -474,6 +474,9 @@ def _stage_dir(app: dict, bid: str) -> Path:
     src = _repo_dir(app["repo"])
     stage = Path("/tmp/builds") / bid
     stage.mkdir(parents=True, exist_ok=True)
+    # bring the clone up to date with GitHub first (fast-forward only; local commits are kept)
+    _git(src, "fetch", "origin", check=False)
+    _git(src, "pull", "--ff-only", check=False)
     # git archive of HEAD: only committed content is deployed
     ar = subprocess.run(["git", "archive", "--format=tar", "HEAD"], cwd=src, capture_output=True, check=True)
     subprocess.run(["tar", "-x", "-C", str(stage)], input=ar.stdout, check=True)
@@ -517,6 +520,12 @@ def _run_build(bid: str, app: dict) -> None:
         rc = proc.wait(timeout=1800)
         shutil.rmtree(stage, ignore_errors=True)
         if rc != 0:
+            cb_id = _cloud_build_id(_build_row(bid) or {})
+            if cb_id:
+                try:
+                    _append_build_log(bid, "--- Cloud Build errors ---\n" + _cloud_build_errors(cb_id))
+                except (subprocess.SubprocessError, OSError):
+                    pass
             _set_build(bid, status="failed", finished_at=_now())
             _set_app(slug, status="failed")
             return
@@ -528,6 +537,68 @@ def _run_build(bid: str, app: dict) -> None:
         _append_build_log(bid, f"error: {e}")
         _set_build(bid, status="failed", finished_at=_now())
         _set_app(slug, status="failed")
+
+
+_CB_ID_RE = re.compile(r"/builds/([0-9a-f-]{36})")
+_CB_TERMINAL = {"SUCCESS": "success", "FAILURE": "failed", "TIMEOUT": "failed", "CANCELLED": "failed",
+                "INTERNAL_ERROR": "failed", "EXPIRED": "failed"}
+
+
+def _cloud_build_id(b: dict) -> str | None:
+    m = _CB_ID_RE.search(b.get("log") or "")
+    return m.group(1) if m else None
+
+
+def _cloud_build_errors(cb_id: str) -> str:
+    """Error-ish lines from the Cloud Build log (so failures are diagnosable without the console)."""
+    r = subprocess.run([gcloud_bin(), "builds", "log", cb_id, "--region", region(), "--project", project() or ""],
+                       capture_output=True, text=True, timeout=120)
+    lines = [ln for ln in (r.stdout or "").splitlines() if ln.strip()]
+    errs = [ln for ln in lines if re.search(r"error|failed|✖|ERROR|not found|Cannot", ln)]
+    return "\n".join((errs or lines)[-40:])
+
+
+def _reconcile_build(b: dict | None) -> dict | None:
+    """The build thread runs inside a Cloud Run instance that may be throttled or recycled before Cloud Build
+    finishes, leaving the row at queued/running forever. Ask Cloud Build for the truth when we read a build."""
+    if not b or b["status"] not in ("queued", "running"):
+        return b
+    age = (_now() - b["started_at"]).total_seconds()
+    if age < 90:
+        return b
+    cb_id = _cloud_build_id(b)
+    if not cb_id:
+        if age > 1800:
+            _append_build_log(b["id"], "error: build never reached Cloud Build (instance recycled?) — marked failed")
+            _set_build(b["id"], status="failed", finished_at=_now())
+            _set_app(b["slug"], status="failed")
+            return _build_row(b["id"])
+        return b
+    try:
+        r = subprocess.run([gcloud_bin(), "builds", "describe", cb_id, "--region", region(), "--project", project() or "",
+                            "--format", "value(status)"], capture_output=True, text=True, timeout=60)
+        cb_status = (r.stdout or "").strip()
+    except (subprocess.SubprocessError, OSError) as e:
+        log.warning("reconcile %s: %s", b["id"], e)
+        return b
+    final = _CB_TERMINAL.get(cb_status)
+    if not final:
+        return b
+    app = _app(b["slug"])
+    if final == "success" and app:
+        url = f"https://{app['custom_domain']}" if app.get("custom_domain") else f"https://{app['firebase_site']}.web.app"
+        _append_build_log(b["id"], f"Cloud Build {cb_id}: SUCCESS (reconciled)")
+        _set_build(b["id"], status="success", finished_at=_now(), url=url)
+        _set_app(b["slug"], status="live", url=url)
+    else:
+        try:
+            errs = _cloud_build_errors(cb_id)
+        except (subprocess.SubprocessError, OSError):
+            errs = "(could not fetch Cloud Build log)"
+        _append_build_log(b["id"], f"Cloud Build {cb_id}: {cb_status}\n--- Cloud Build errors ---\n{errs}")
+        _set_build(b["id"], status="failed", finished_at=_now())
+        _set_app(b["slug"], status="failed")
+    return _build_row(b["id"])
 
 
 @tool
@@ -544,7 +615,7 @@ def deploy_app(slug: str) -> str:
         return f"error: repo {app['repo']} is not opened — call repo_open first"
     if _git(path, "status", "--porcelain", check=False):
         return "error: working tree has uncommitted changes — commit (repo_commit_push) or discard them first"
-    running = _build_row(app["last_build_id"]) if app.get("last_build_id") else None
+    running = _reconcile_build(_build_row(app["last_build_id"])) if app.get("last_build_id") else None
     if running and running["status"] in ("queued", "running"):
         return f"a build for {slug} is already running ({running['id']})"
     bid = f"{slug}-{uuid.uuid4().hex[:8]}"
@@ -564,8 +635,10 @@ def app_status(slug: str) -> str:
     if app.get("custom_domain"):
         out.append(f"custom domain: {app['custom_domain']}")
     if app.get("last_build_id"):
-        b = _build_row(app["last_build_id"])
+        b = _reconcile_build(_build_row(app["last_build_id"]))
         if b:
+            app = _app(app["slug"]) or app
+            out[0] = f"{app['slug']} — {app['title']} | repo={app['repo']}@{app['branch']} | status={app['status']} | url={app['url']}"
             out.append(f"build {b['id']}: {b['status']} started {b['started_at']:%H:%M:%S}Z"
                        + (f" finished {b['finished_at']:%H:%M:%S}Z" if b.get("finished_at") else ""))
             out.append("--- log tail ---\n" + "\n".join((b["log"] or "").splitlines()[-25:]))
@@ -575,7 +648,7 @@ def app_status(slug: str) -> str:
 @tool
 def build_log(build_id: str, tail_lines: int = 120) -> str:
     """Full (or tail of the) log of a build id returned by deploy_app."""
-    b = _build_row(build_id.strip())
+    b = _reconcile_build(_build_row(build_id.strip()))
     if not b:
         return "not found"
     lines = (b["log"] or "").splitlines()
