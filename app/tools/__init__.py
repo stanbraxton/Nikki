@@ -43,9 +43,9 @@ class ToolRegistry:
     def _load_builtin(self) -> None:
         if self._builtin:
             return
-        from app.tools import custom_api, db_query, engineer, files, google_ws, knowledge, memory, microsoft, scheduler, self_maintain, spaces, web
+        from app.tools import custom_api, db_query, engineer, files, google_ws, images, knowledge, memory, microsoft, scheduler, self_maintain, spaces, web
 
-        for mod in (files, db_query, self_maintain, spaces, engineer, knowledge):  # platform-admin only
+        for mod in (files, db_query, self_maintain, spaces, engineer, knowledge, images):  # platform-admin only
             for t in mod.TOOLS:
                 t.metadata = {**(t.metadata or {}), "admin_only": True}
             self._builtin.extend(mod.TOOLS)

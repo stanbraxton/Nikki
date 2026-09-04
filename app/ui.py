@@ -14,6 +14,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Too
 
 from app import persistence
 from app.agent import build_graph, pending_tool_calls, rejection_messages, text_of
+from app.tools.images import IMAGE_MARK
 from app.config import settings
 from app.tenancy import Principal, set_principal
 from app.tools import registry
@@ -189,6 +190,15 @@ class TurnRenderer:
         self.steps[tc["id"]] = step
         await persistence.trace(self.thread_id, "tool_call", tc)
 
+    async def show_image(self, out: str) -> None:
+        """Render an image a tool saved in the workspace inline in the chat."""
+        rel = out[len(IMAGE_MARK):].split(" (", 1)[0].strip()
+        path = (settings.workspace_dir / rel).resolve()
+        if not path.is_file() or settings.workspace_dir.resolve() not in path.parents:
+            return
+        img = cl.Image(name=path.name, path=str(path), display="inline", size="large")
+        await cl.Message(content="", elements=[img]).send()
+
     async def tool_result(self, tm: ToolMessage) -> None:
         step = self.steps.pop(tm.tool_call_id, None)
         out = text_of(tm.content)
@@ -198,6 +208,8 @@ class TurnRenderer:
         step.output = out
         step.is_error = getattr(tm, "status", "success") == "error"
         await step.update()
+        if tm.name == "generate_image" and out.startswith(IMAGE_MARK):
+            await self.show_image(out)
         if tm.name == "deploy_space" and out.startswith("queued deploy of Space"):
             m = re.search(r"Space '([a-z0-9-]+)'", out)
             if m:
