@@ -18,7 +18,7 @@ max_size_mb = 20
 
 [UI]
 name = "Nikki"
-description = "Nikki AiA your personal assistant"
+description = "Nikki AiA your personal Ai Assistant"
 default_theme = "dark"
 layout = "default"
 cot = "full"

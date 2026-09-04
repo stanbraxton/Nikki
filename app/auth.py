@@ -178,7 +178,7 @@ def _page(title: str, body: str) -> str:
 def _signup_form(error: str = "", email: str = "", name: str = "") -> str:
     err = f'<div class="err">{error}</div>' if error else ""
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Create account · Nikki</title>{STYLE}</head>
-<body><div class="card"><h1>Create your Nikki account</h1><p class="muted">Nikki AiA your personal assistant with memory, web research, integrations and scheduled tasks.</p>
+<body><div class="card"><h1>Create your Nikki account</h1><p class="muted">Nikki AiA your personal Ai Assistant with memory, web research, integrations and scheduled tasks.</p>
 <form method="post" action="/signup">
 <label>Name or company<input name="name" value="{name}" maxlength="120"></label>
 <label>Email<input name="email" type="email" value="{email}" required></label>
