@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from app import persistence
 from app.google_oauth import router as google_router
+from app.legal import router as legal_router
 from app.scheduler import router as scheduler_router
 from app.spaces_gallery import router as spaces_router
 from app.config import ROOT, settings
@@ -61,5 +62,6 @@ async def skills() -> list[dict]:
 app.include_router(spaces_router)
 app.include_router(google_router)
 app.include_router(scheduler_router)
+app.include_router(legal_router)
 
 mount_chainlit(app=app, target=str(ROOT / "app" / "ui.py"), path="/")
