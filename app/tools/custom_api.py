@@ -56,12 +56,33 @@ def call_api(api: str, path: str, method: str = "GET", query: str = "", body: st
         r = httpx.request(method, url, params=params, json=data, headers=headers, timeout=30, follow_redirects=False)
     except httpx.HTTPError as e:
         return f"error: {e}"
+    return _render(r, max_chars)
+
+
+def _render(r: httpx.Response, max_chars: int) -> str:
+    """Format a response for the model. Never truncate silently: always report the true
+    number of items in a JSON array (top-level or under a single `data`/`items`/`results` key)."""
+    max_chars = max(500, min(int(max_chars or 8000), 60000))
     text = r.text
+    summary = ""
     try:
-        text = json.dumps(r.json(), indent=1, ensure_ascii=False)
+        payload = r.json()
+        text = json.dumps(payload, indent=1, ensure_ascii=False)
+        items = payload
+        if isinstance(payload, dict):
+            for k in ("data", "items", "results", "records"):
+                if isinstance(payload.get(k), list):
+                    items = payload[k]
+                    break
+        if isinstance(items, list):
+            summary = f" — JSON array with {len(items)} items"
     except ValueError:
         pass
-    return f"HTTP {r.status_code}\n{text[:max_chars]}"
+    head = f"HTTP {r.status_code}{summary}"
+    if len(text) > max_chars:
+        head += (f"\n[TRUNCATED: showing {max_chars} of {len(text)} chars. Do NOT count or total from this partial view; "
+                 "the item count above is authoritative. Re-call with a larger max_chars (up to 60000) or a narrower query if you need the rows.]")
+    return f"{head}\n{text[:max_chars]}"
 
 
 @tool
