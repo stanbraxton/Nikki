@@ -36,12 +36,25 @@ def make_model(spec: str | None = None) -> BaseChatModel:
 
 
 def system_prompt() -> str:
+    from datetime import datetime, timezone
+
+    from app.tools.memory import memory_digest
+
     skills = registry.skill_report()
     loaded = ", ".join(t for s in skills for t in s["tools"]) or "none yet"
+    digest = memory_digest()
+    memory_block = f"What you remember about the user (long-term memory):\n{digest}\n\n" if digest else ""
     return (
         f"{settings.persona}\n\n"
-        "Capabilities: file tools (workspace-sandboxed), SQL tools, and self-maintenance tools "
-        "that let you author new Python skills (write_skill) which become live tools instantly. "
+        f"Current date/time: {datetime.now(timezone.utc):%A %Y-%m-%d %H:%M} UTC.\n\n"
+        f"{memory_block}"
+        "Capabilities: file tools (workspace-sandboxed), SQL tools, web_search + http_fetch for live web "
+        "information (always search when a question depends on current facts, then cite URLs), Gmail and Google "
+        "Drive tools for the linked Google accounts (google_accounts lists them; if none is linked, tell the user "
+        "to open /connect/google), scheduling tools (schedule_task creates recurring unattended runs whose results "
+        "appear at /schedules), long-term memory (remember/recall/forget — proactively call remember when the user "
+        "shares a lasting fact, preference, person or project detail; never store secrets), and self-maintenance "
+        "tools that let you author new Python skills (write_skill) which become live tools instantly. "
         f"User-authored skills currently loaded: {loaded}.\n"
         "When a task needs a capability you lack, propose a skill, use skill_template, then write_skill. "
         "Spaces: you can build and deploy independent web micro-apps (dashboards, trackers, calculators) "

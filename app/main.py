@@ -9,6 +9,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from sqlalchemy import select
 
 from app import persistence
+from app.google_oauth import router as google_router
+from app.scheduler import router as scheduler_router
 from app.spaces_gallery import router as spaces_router
 from app.config import ROOT, settings
 from app.tools import registry
@@ -24,7 +26,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Nikki", version="0.1.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(title="Nikki", version="0.3.0", lifespan=lifespan, docs_url=None, redoc_url=None)
 
 
 def _admin(authorization: str = Header(default="")) -> None:
@@ -57,5 +59,7 @@ async def skills() -> list[dict]:
 
 
 app.include_router(spaces_router)
+app.include_router(google_router)
+app.include_router(scheduler_router)
 
 mount_chainlit(app=app, target=str(ROOT / "app" / "ui.py"), path="/")

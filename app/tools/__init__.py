@@ -43,9 +43,9 @@ class ToolRegistry:
     def _load_builtin(self) -> None:
         if self._builtin:
             return
-        from app.tools import db_query, files, self_maintain, spaces
+        from app.tools import db_query, files, google_ws, memory, scheduler, self_maintain, spaces, web
 
-        for mod in (files, db_query, self_maintain, spaces):
+        for mod in (files, db_query, self_maintain, spaces, web, google_ws, scheduler, memory):
             self._builtin.extend(mod.TOOLS)
 
     # ---- skills ----------------------------------------------------------

@@ -43,6 +43,52 @@ spaces = Table(
     Column("last_error", Text),
 )
 
+memories = Table(
+    "memories",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column("kind", String(24), nullable=False),  # fact | preference | project | person | other
+    Column("content", Text, nullable=False),
+    Column("source_thread", String(64)),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
+google_tokens = Table(
+    "google_tokens",
+    metadata,
+    Column("email", String(200), primary_key=True),
+    Column("refresh_token", Text, nullable=False),
+    Column("scopes", Text, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
+schedules = Table(
+    "schedules",
+    metadata,
+    Column("name", String(60), primary_key=True),
+    Column("cron", String(60), nullable=False),
+    Column("timezone", String(60), nullable=False),
+    Column("prompt", Text, nullable=False),
+    Column("job_name", Text, nullable=False),  # Cloud Scheduler resource name
+    Column("auto_approve", String(5), nullable=False, default="false"),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+
+scheduled_runs = Table(
+    "scheduled_runs",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column("schedule", String(60), index=True, nullable=False),
+    Column("thread_id", String(64), nullable=False),
+    Column("started_at", DateTime(timezone=True), nullable=False),
+    Column("finished_at", DateTime(timezone=True)),
+    Column("status", String(16), nullable=False),  # running | ok | error
+    Column("output", Text),
+    Column("error", Text),
+)
+
 _engine: AsyncEngine | None = None
 _sync_engine = None
 

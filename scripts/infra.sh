@@ -79,6 +79,24 @@ gcloud artifacts repositories add-iam-policy-binding cloud-run-source-deploy --l
   --member="serviceAccount:$BUILD_SA" --role=roles/artifactregistry.writer -q >/dev/null
 echo "spaces IAM applied (runtime=$RUNTIME_SA, spaces=$SPACES_SA, build=$BUILD_SA)"
 
+echo "== Scheduler (recurring unattended tasks via Cloud Scheduler -> /api/run)"
+SCHED_SA="nikki-scheduler@${PROJECT}.iam.gserviceaccount.com"
+gcloud services enable cloudscheduler.googleapis.com -q
+# Identity Cloud Scheduler uses to call Nikki (OIDC); Nikki verifies the token's email == this SA. Zero roles.
+gcloud iam service-accounts describe "$SCHED_SA" >/dev/null 2>&1 || \
+  gcloud iam service-accounts create nikki-scheduler --display-name="Nikki scheduler caller (no roles)" -q
+gcloud projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:$RUNTIME_SA" --role=roles/cloudscheduler.admin -q --condition=None >/dev/null
+gcloud iam service-accounts add-iam-policy-binding "$SCHED_SA" --member="serviceAccount:$RUNTIME_SA" --role=roles/iam.serviceAccountUser -q >/dev/null
+# Optional integrations: Google OAuth client (Gmail/Drive) and Tavily (web search). Empty secrets are fine;
+# Nikki falls back to DuckDuckGo and reports Google as "not configured" until values are added.
+for s in GOOGLE_OAUTH_CLIENT_ID GOOGLE_OAUTH_CLIENT_SECRET TAVILY_API_KEY; do
+  gcloud secrets describe "$s" >/dev/null 2>&1 || gcloud secrets create "$s" --replication-policy=automatic -q
+  # Secret Manager rejects empty payloads and Cloud Run refuses to deploy a secret with no version -> seed "\n"
+  [ -n "$(gcloud secrets versions list "$s" --format='value(name)' --limit=1)" ] || printf '\n' | gcloud secrets versions add "$s" --data-file=- -q
+  gcloud secrets add-iam-policy-binding "$s" --member="serviceAccount:$RUNTIME_SA" --role=roles/secretmanager.secretAccessor -q >/dev/null
+done
+echo "scheduler IAM applied (scheduler SA=$SCHED_SA)"
+
 echo "== Cloud SQL Postgres (db-f1-micro, ~\$9/mo)"
 if [ "${SKIP_SQL:-0}" = "1" ]; then echo "skipped (SKIP_SQL=1)"; echo "infra done (no sql)"; exit 0; fi
 if ! gcloud sql instances describe "$SQL_INSTANCE" >/dev/null 2>&1; then
