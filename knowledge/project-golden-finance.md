@@ -1,52 +1,58 @@
-# Golden Finance — personal finance app
+# Golden Finance — Personal Finance App
 
-Golden Finance is a React/Vite + Convex web app (currently hosted on the old platform; slated for migration to Stan's own GitHub + Firebase Hosting + Convex account) built for Stan Braxton. It is a comprehensive personal and business finance application that handles spending, budgets, net worth, bills, and charts, fed by automated Chase and PNC statement imports.
+Golden Finance is a comprehensive personal and business finance application built for Stan Braxton, handling spending, budgets, net worth, bills, charts, and automated statement imports.
 
-## Summary
-Golden Finance provides automated financial ingestion, categorization, and forecasting for Stan Braxton. It includes advanced modules for debt payoff, tax tagging, asset tracking, document management, and yearly project planning (Y2Y).
+## Summary & Hosting
+- **Project Name:** `golden-finance`
+- **Hosting & Domain:** Hosted on the legacy hosting platform, with a custom domain `www.mygoldenfinance.com` LIVE (root 302-redirect via Squarespace forwarding; CNAME and TXT configured at Squarespace DNS) [2026-08-15]. Slated for migration to Stan's own GitHub + Firebase Hosting + Convex account.
+- **Access Control:** Public-facing routing with application-level owner sign-in protecting data. Workspace members edge access (`auth.mode: authenticated`).
+- **Convex Databases:** Production Convex (`https://sincere-newt-681.convex.cloud`) uses a separate database from preview; data imported in preview does not appear in production. Import statements directly in production.
 
-## Business & pricing
-- Single-user application tailored for Stan Braxton with owner authentication.
-- Custom domain: `www.mygoldenfinance.com` LIVE (root 302-redirect via Squarespace forwarding; CNAME + TXT configured at Squarespace DNS) [2026-08-15].
-- Production access uses public-facing routing with application-level owner sign-in protecting data.
+## Architecture & Data Model
+- **Backend & Schema:** Built on React, Vite, and Convex (`convex/schema.ts`). Tables include accounts, transactions, budgets, bills, netWorthSnapshots, tasks, taskUsers, scenarioItems, goals, holdings, documents, and projects (all `userId`-scoped).
+- **App Functions:** All backend functions in `convex/finance.ts` use `authenticatedQuery` or `authenticatedMutation`.
+- **Permanent Admin Operations (`convex/adminOps.ts`, since 2026-08-13):** Secret-gated production endpoints replace obsolete temporary deploy patterns:
+  - `exportAll` (query, dumps all 5 core tables)
+  - `importRows` (mutation, de-duped transaction import)
+  - `upsertBills` (mutation, upsert by name)
+  - Secrets live in `scripts/.admin_secret`; IDs/URLs in `scripts/config.json`. Executed via Bun (`ConvexHttpClient` + `anyApi`).
+- **Frontend & Routing:** Pages in `src/pages/` include Overview (`/dashboard`), Transactions, Import, Budgets, Accounts, Bills, Tasks, Subscriptions, Forecast, NetWorth, Debts, Goals, Tax Center, Investments, Document Vault, and Y2Y.
+- **Amounts & Transfers:** Negative = money out, positive = money in. Liability accounts (`credit`, `loan`) store amounts owed and subtract from net worth. The `Transfers` category and internal transfers are excluded from income/spend totals to prevent card payment double-counting.
+- **De-duplication & Months:** Imports de-dupe on `date|lowercased description|amount` (`by_user_dedupe`). Month pages default to the latest month with data (`useDefaultMonth`).
 
-## Architecture
-- **Stack:** React, Vite, Tailwind/CSS components, Convex backend, `pdfjs-dist` for client-side PDF extraction.
-- **Convex Schema (`convex/schema.ts`):** Tables for accounts, transactions, budgets, bills, netWorthSnapshots, tasks, taskUsers, scenarioItems, goals, holdings, documents, and projects (all `userId`-scoped).
-- **Backend & Admin:** `convex/finance.ts` (`authenticatedQuery`/`authenticatedMutation`), `convex/adminOps.ts` (permanent secret-gated endpoints: `exportAll`, `importRows`, `upsertBills`), `convex/tasks.ts`, `convex/documents.ts`.
-- **Pages & Components:** `src/pages/` (Overview/Dashboard, Transactions, Import, Budgets, Accounts, Bills, TasksPage, Subscriptions, Forecast, NetWorth, Debts, ScopeFilter, Goals, Tax Center, Investments, Document Vault, Y2YPage).
-- **Testing:** Comprehensive test suite (`scripts/finance-flow-test.ts`, `scripts/pdf-import-test.ts`, `scripts/pnc-parse-test.ts`, `scripts/tasks-test.ts`, `scripts/expansion-test.ts`, `scripts/addons-test.ts`, `scripts/y2y-test.ts`). E2E suites run in parallel; test user is shared across runs.
+## Parsers & Statement Imports
+- **PDF & CSV Parsing:** Statement PDFs are parsed entirely client-side via `pdfjs-dist` (lazy-imported, worker via `?url`); files never leave the browser. The parser reconstructs lines by y-position and matches `MM/DD desc amount`.
+- **PNC Statements:** PNC Virtual Wallet statements group transactions in sections determining signs (deposits, checks, debit/online withdrawals, other deductions). Descriptions wrap and page-margin summary text is handled. Year is derived from the period header.
+- **Business Statements (PNC Business Checking):** Uses `rowsFromPncStatement` with business section headers added to `PNC_SECTIONS`, noise-line filtering, and two-checks-per-row regex. *Gotcha:* Unrecognized section headers can silently flip transaction signs; always verify `PNC_SECTIONS` coverage.
 
-## Data model
-- **Amounts:** Negative = money out, positive = money in. Liability accounts (`credit`, `loan`) store the amount owed and subtract from net worth.
-- **Transfers:** The `Transfers` category and internal transfers are excluded from income/spend totals to prevent card payment double-counting.
-- **Import De-duplication:** De-dupes on `date|lowercased description|amount` (`by_user_dedupe`).
-- **Extensions:** Accounts support optional `scope` (`personal` default | `business`), `apr`, and `minPayment`. Transactions support optional `taxTag` (`deductible` | `business`) and `projectId`.
+## Scheduled Automations (Set up 2026-08-13)
+- **Weekly Backup Scheduled Job:** Wed 6am ET / `0 10 * * 3` UTC via `scripts/gf_backup.py`. Exports all tables via `adminOps:exportAll`, writes JSON + CSVs + README, zips source, and uploads to Drive folder "Personal → Golden Finance Backups" (ID `1s-TnvWbvYrc9VhZpGVkMp3mfwKFyjD0S`), deleting superseded copies. Deploy-free.
+- **Statement Auto-Import Scheduled Job:** Daily 7am ET via `scripts/gf_statement_autoimport.py` (skipped when no new files via `scripts/gf_autoimport_condition.py`). Watches Drive folder "Personal → Chase Statements" (ID `1UTQHGJf6LQUj2Noz2TYhgZjOPG_keCTd`), parses CSV/PDF, imports to prod, and DMs Stan a summary. Filename routing: "saving" → savings, "business" → business, else checking. State tracked in `state/processed_statement_files.json`.
+- **Monthly Spending Report Scheduled Job:** 1st of month 8am ET. Pre-run script `scripts/gf_monthly_report_prerun.py` supplies last-month vs prior-month numbers for agent reporting to Stan.
 
-## Key logic
-- **Parsers & Categorization:** Keyword auto-categorizer, CSV parser, generic statement parser, and `rowsFromPncStatement` for PNC statements (handles deposits, checks, debit/online withdrawals, page-margin text, period-based year detection, and business section headers). Client-side PDF extraction via `pdfjs-dist` (reconstructs lines by y-position, matches `MM/DD desc amount`).
-- **Insights & Reviews:** `buildMonthlyReview` in `src/finance/insights.ts` powers the Overview review card (where-the-money-went lines and rule-based recommendations like betting volume, subscriptions >$150, Zelle/Cash App >$500). Month pages default to the latest month with data (`useDefaultMonth`).
-- **Engines:** Cash flow forecasting (`src/finance/forecast.ts`), debt payoff simulation (`src/finance/debts.ts` supporting avalanche/snowball/minimum), and yearly project planning (`src/finance/y2y.ts` calculating cash flow profile, feasibility bands, suggested target months, cut candidates, and projected finish months).
+## Financial Tasks & Add-on Modules (Built 2026-08-13)
+- **Financial Tasks & Priorities:** Backend `convex/tasks.ts`, frontend `src/pages/TasksPage.tsx` (`/tasks`). Supports List and Board (kanban, HTML5 drag-drop + status select) views, task users, statuses (`todo`, `in_progress`, `under_review`, `completed`), priorities, monetary impact, recurring tasks with auto-spawn (`spawnNextOccurrence`), attachments via Convex storage, and overdue alert banners.
+- **Recurring Bills & Subscriptions (`/subscriptions`):** `bills` table with cadence (`monthly`, `annual`), renewal month, category, and active status.
+- **Cash Flow & Scenario Forecaster (`/forecast`):** Engine `src/finance/forecast.ts` combines cash accounts, bill schedules, and daily discretionary spend across 30/60/90-day horizons with negative-cash alerts.
+- **Net Worth & Asset Tracker (`/networth`):** Groups accounts by type (including `real_estate`, `vehicle`) with snapshot history.
+- **Debt Payoff Planner (`/debts`):** Supports avalanche, snowball, and minimum payment simulation (`src/finance/debts.ts`).
+- **Combined Personal + Business:** Accounts support optional `scope` (`personal` default | `business`). Filtered via `ScopeFilter.tsx`.
+- **Savings Goals (`/goals`):** Progress tracking from linked account balances or manual contributions.
+- **Tax Center (`/tax`):** Transaction tax tags (`deductible`, `business`) and quarterly worksheet.
+- **Investment Holdings (`/investments`):** Holdings table with manual price tracking without double-counting account balances.
+- **Document Vault (`/documents`):** Document table + Convex storage (`convex/documents.ts`).
 
-## Integrations & APIs
-- **Database:** Convex Cloud database (`https://sincere-newt-681.convex.cloud`) with separate DBs for preview and production.
-- **Google Drive & Backups:** Automated weekly backups (`scripts/gf_backup.py` exporting tables, uploading JSON/CSVs/README/zip to Drive folder "Personal → Golden Finance Backups") and daily statement auto-imports (`scripts/gf_statement_autoimport.py` watching Drive folder "Personal → Chase Statements").
-- **Admin Operations:** Secret-gated endpoints in `convex/adminOps.ts` called via Bun (`ConvexHttpClient` + `anyApi`), using secrets from `scripts/.admin_secret` and config from `scripts/config.json`.
+## Y2Y Yearly Project Planner (Built 2026-08-15)
+- Located under Organize (`/y2y`, `src/pages/Y2YPage.tsx`).
+- **Projects Table:** Statuses include `idea` (parking lot, no date/cost needed), `funding`, `in_progress`, `done`. Transactions gain optional `projectId` for actual spend tracking (tagged via calendar-icon dropdown).
+- **Engine (`src/finance/y2y.ts`):** Calculates free cash flow profile from last ≤6 complete months (excluding transfers, current partial month, and single inflows ≥ $10k), feasibility bands (fits/tight/over), suggested target months, cut candidates, projected finish months, and bill cluster notes.
+- **Features:** 2-step wizard, default 15% contingency, priority reordering (`reorderProjects`), forecast synthetic scenario integration, goal conversion (`convertGoalToProject`), and task creation from projects.
 
-## Status
-- Fully operational web application [2026-08-12 to 2026-08-15].
-- Custom domain `www.mygoldenfinance.com` LIVE [2026-08-15].
-- Permanent admin data access (`adminOps.ts`) deployed [2026-08-13].
-- Recurring automations (backups, statement auto-import, monthly spending report) and 15 recurring bills seeded [2026-08-13].
-- Tasks, recurring bills/subscriptions, cash flow forecasting, net worth tracking, debt payoff, multi-scope filtering, savings goals, tax center, investment holdings, document vault, and Y2Y yearly planner fully implemented [2026-08-13 to 2026-08-15].
-
-## Gotchas & lessons
-- **PNC / Business Parsers:** Unrecognized PNC section headers can silently flip transaction signs; always verify `PNC_SECTIONS` coverage. Personal and business internal transfers reference account XXXXX3465 and must remain excluded from combined totals.
-- **Convex CLI:** `bunx convex dev --once` fails with `EPERM: copyfile` unless run with `CONVEX_TMPDIR=./tmp` with `tmp/` pre-created.
-- **Deploys & Ports:** Platform deploys are rate-limited (20/day); Convex functions push before frontend steps, so backend changes land even if frontend deployment fails. Kill stale `vite preview` processes on port 4173 before running Playwright tests.
-- **Test Contamination:** E2E tests share one reused test user, causing cross-test contamination. Month-scoped pages default to the latest month with data; tests must explicitly navigate the `MonthPicker` to fixture months and avoid asserting on raw body text (toasts). Run tests like `tasks-test.ts` alone if parallel execution causes flakes with task totals.
-- **UI Seeding:** Transactions "Direction" and Bills "Type" selects persist between adds; set them explicitly per row.
-
-## Open items
-- Migrate the application from the old platform hosting to Stan's own GitHub + Firebase Hosting + Convex account [slated].
-- Investigate unexplained statement items: recurring Zelle to Ihor Krislaty (~$1,300–1,800/mo, personal), "Expay Bus Csr" ($868, July, personal), and Santander billpay ($1,300, July, personal) [2026-08-13]. (Note: $50k "Instpmntout Rob Hunter" in June 2026 is confirmed intentional by Stan).
+## Testing & Development Gotchas
+- **Test Suites:** Comprehensive test scripts (`scripts/finance-flow-test.ts`, `scripts/pdf-import-test.ts`, `scripts/tasks-test.ts`, `scripts/expansion-test.ts`, `scripts/addons-test.ts`, `scripts/y2y-test.ts`).
+- **Parallel Testing Gotcha:** E2E test suites run in parallel per invocation. `tasks-test` counts task totals and will flake if run alongside `expansion-test`'s seeded tasks; run it alone.
+- **Shared Test User:** Tests share a reused test user, leading to cross-test data contamination. Month-scoped pages default to latest data; tests must explicitly navigate the `MonthPicker` to fixture months and assert on scoped locators rather than raw body text.
+- **CLI Command Gotcha:** `bunx convex dev --once` fails with `EPERM: copyfile` unless run with `CONVEX_TMPDIR=./tmp` (ensure `tmp/` folder exists in project).
+- **Deploys:** Platform deploys are rate-limited (20/day). Convex functions push before Vercel steps, so backend changes succeed even if frontend deployment fails.
+- **UI Seeding Gotcha:** Transactions "Direction" and Bills "Type" selects persist between adds; always set them explicitly per row.
+- **Port Conflict:** Kill stale `vite preview` processes on port 4173 before running Playwright tests.

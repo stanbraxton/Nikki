@@ -1,48 +1,59 @@
 # Mymation Cloud — adaptive-memory AI chat SaaS
 
 ## Summary
-Mymation Cloud is a transparent, consent-gated belief and memory AI chat SaaS designed for users seeking auditable personal AI interactions. It features strict provenance tracking, consent-gated memory commits, and local-first execution capabilities, operating as a sibling to Mymation Desktop under the broader Mymation umbrella.
+Mymation Cloud is Stan Braxton's proprietary transparent, consent-gated belief/memory AI chat SaaS — an auditable personal AI product with strict provenance tracking, consent-gated memory commits, and local-first execution capabilities. It is a sibling product to Mymation Desktop (repo-relative path `skills/adaptive_desktop/` in earlier notes) and is not built on Stan's previous engineering assistant's platform. Read the spec before changing, extending, or deploying it.
 
 ## Business & pricing
-- **Umbrella Brand:** Mymation covers both the assistant family and the separate Mymation Studio workflow platform. Both share a single Stripe account; product display names are distinguished with suffixes.
-- **Positioning [2026-08-24]:** Built around the thesis "the memory you can audit." Core pillars include consent-gated memory, provenance-with-receipts, and local execution. Marketing leads with Desktop. Category name candidates: "auditable memory" or "consent-gated memory."
-- **Competitive Landscape [2026-08-24]:** ChatGPT introduced "Dreaming V3" memory free tier [2026-06]; Claude memory has been free since [2026-03]; Meta acquired Limitless [2025-12] and Rewind sunsetted. Msty Aurum ($149/user/yr) is the closest paid local competitor (though it lacks a memory system).
-- **Comp Accounts:** Admin and comped accounts utilize a subscription row with `stripe_customer_id='comp_<name>'`, active status, and period end set to 2099, making them invisible to Stripe webhooks (portal lookups exclude `comp_%`). Stan is comped [2026-08-15].
+- **Umbrella brand (2026-08-15):** Mymation covers both product lines — this assistant family (Mymation Cloud/Desktop) AND the separate Mymation Studio workflow platform (referenced elsewhere as `graphworks`). Both share the same Stripe account; distinguish product display names with suffixes.
+- **Positioning (2026-08-24):** A brief PDF and build script live at a temp working path (`mymation_brief`). Thesis: "the memory you can audit." Pillars: consent-gated memory / provenance-with-receipts / runs fully local. Marketing should lead with Desktop. Category name candidates: "auditable memory" / "consent-gated memory."
+- **Competitive landscape [web, 2026-08-24]:** ChatGPT "Dreaming V3" memory went free tier in Jun 2026; Claude memory has been free since Mar 2026; Meta acquired Limitless in Dec 2025 and Rewind was sunset; Msty Aurum ($149/user/yr) is the closest paid local competitor but has no memory system.
+- **Comp/admin accounts [db, 2026-08-15]:** Implemented via a subscription row with `stripe_customer_id='comp_<name>'`, status active, period_end 2099 — invisible to Stripe webhooks (portal lookup excludes `comp_%`). Stan is comped.
 
 ## Architecture
-- **App Stack:** A React/Vite + Convex web app (currently hosted on the old platform; slated for migration to Stan's own GitHub + Firebase Hosting + Convex account). 
-- **Repository:** Private GitHub repository `stanbraxton/mymation-cloud` (`api/` FastAPI backend, `web/` Next.js frontend). Pull request workflow required from M1 onward.
-- **Infrastructure & Services:** Uses Neon (PostgreSQL with pgvector), Clerk, Stripe (test sandbox), Railway, Vercel, Anthropic, and OpenAI.
-- **Memory Storage:** Retrieved episodes reside in a second uncached system block to ensure the primary cached profile block remains byte-identical for prompt caching.
+- **Repo:** Private GitHub `stanbraxton/mymation-cloud`, cloned locally to a repos working directory (`api/` = FastAPI, `web/` = Next.js). PR flow required from milestone M1 onward. Never use raw git/gh shell commands — use the `sdk.tools.github_tools.coworker_git` and `sdk.tools.coworker_github.coworker_github_cli` async tools (must await).
+- **Source of truth:** Spec document (SPEC.md, v1.4) — read the relevant Part before touching anything; also a todo/status file. Secrets are stored in `.env` files (chmod 600) covering Neon, Clerk, Stripe (test sandbox), Railway, Vercel, Anthropic, OpenAI.
+- **Memory design:** Retrieved episodes go into a SECOND uncached system block; the cached profile block must stay byte-identical to preserve prompt caching.
 
 ## Data model
-- **Schema & Migrations:** Migration 002 includes usage cache columns. Migration SQL must be validated using `pglast`.
-- **Vector Search:** Utilizes `pgvector` via `asyncpg`. Vectors are passed as text literals `[x,y,...]` and cast via `$n::vector` (using the `memory.vector_literal` helper). Retrieval ceiling is verified live at 0.75 cosine distance.
-- **Provenance & Audit:** Supports deep traceability (`GET /memory/facts/{id}/history`), exposing source message quotes, supersede chains, delta outcomes, and audit trails.
+- Migration 002 added usage cache columns. Always validate migration SQL with `pglast`.
+- **Vector search:** pgvector via asyncpg — pass vectors as text literal `[x,y,...]` cast `$n::vector` (helper `memory.vector_literal`). Retrieval ceiling verified live at 0.75 cosine distance.
+- **Provenance/audit:** `GET /memory/facts/{id}/history` returns provenance — source message quote, supersede chain, delta outcomes, and audit trail. The Memory page has "why?" panels and resolves pending cards.
 
 ## Key logic
-- **Memory & Chat Prompting:** The chat system prompt strictly forbids the AI from claiming memory operations have occurred (reflection owns commits). Casual retold banter ("I told my friend X") is capped at ≤0.6 confidence to prevent auto-committing. Differing-value candidates are superseded by the latest assertion rather than reinforced.
-- **M3 Reflection & Evaluation:** Evaluated using a golden set at `api/tests/golden/reflection_cases.json` via the live runner `api/scripts/reflection_eval.py` (requires `ANTHROPIC_API_KEY` and dummy environment variables). Must be run after any reflection prompt change, targeting zero false cards. Anthropic forced tool-use (`complete_tool`) enforces schema-constrained JSON, distinguishing between updates (prior stays true) and contradictions (prior no longer true).
-- **Nikki Help Widget:** Provides on-device keyword search over `web/src/content/helpArticles.ts` via `helpSearch.ts` (accounts for stemmer quirks, e.g., "stores"→"stor(e)" while "stored" remains unchanged; synonym keys must be pre-stemmed such as `everyth`), backed by the Help Center at `/app/help` and the API endpoint `POST /help/ask` (haiku via `complete_tool`, grounded in client-sent help excerpts with a 5/min in-memory rate limit) [2026-08-15].
+- **Field-test learnings (PR #6):** The chat system prompt must FORBID the AI from claiming memory operations happened (e.g., "I've updated that" was a lie — reflection owns commits). Retold banter ("I told my friend X") is capped at ≤0.6 confidence so it never auto-commits. Differing-value candidates get superseded by the latest assertion, not reinforced.
+- **M3 reflection eval:** Golden eval set at `api/tests/golden/reflection_cases.json`; live runner `api/scripts/reflection_eval.py` (needs `ANTHROPIC_API_KEY` plus dummy required env vars). Run this after ANY reflection-prompt change; bar = zero false cards. Anthropic forced tool-use (`complete_tool`) gives schema-constrained JSON; haiku initially misclassified committed moves as "update" until the prompt spelled out: update = prior stays true, contradiction = prior no longer true.
+- **Nikki help widget (PR #11):** Ported from a sister product (WellCollar), help-first design — on-device keyword search over `web/src/content/helpArticles.ts` via `helpSearch.ts` (keep articles in sync with features). NOTE stemmer quirk: "stores" → "stor(e)" but "stored" stays unchanged; synonym keys must be pre-stemmed (e.g. `everyth`). Backed by Help Center at `/app/help` and API `POST /help/ask` (haiku via `complete_tool`, grounded in client-sent help excerpts, 5/min in-memory rate limit) [app, 2026-08-15].
 
 ## Integrations & APIs
-- **Endpoints & Limits:** Includes health endpoints (`/healthz`, `/readyz`), an admin metrics route (`/admin/metrics` gated by `ADMIN_EMAILS` with a 10/min burst limit), provenance history (`GET /memory/facts/{id}/history`), and help queries (`POST /help/ask`) [2026-08-15].
-- **Stripe Webhooks:** Features a foreign-event guard (since a shared Green Collar account serves Studio, Cloud, and WellCollar) ensuring webhooks only process events matching our price IDs, `product=mymation_cloud` metadata, or already-linked subscription IDs.
-- **Credentials & Secrets:** Secure environment secrets (chmod 600) configured for Neon, Clerk, Stripe, Railway, Vercel, Anthropic, and OpenAI.
+- **Endpoints:** `/healthz`, `/readyz` health checks; `/admin/metrics` gated by `ADMIN_EMAILS` env var with a 10/min burst limit; `GET /memory/facts/{id}/history` (provenance); `POST /help/ask` (help queries).
+- **Stripe webhook foreign-event guard (PR #9):** A shared "Green Collar" Stripe account serves Studio + Cloud + WellCollar products, so the webhook only processes events matching our price IDs / `product=mymation_cloud` metadata / already-linked subscription IDs.
+- **Secrets:** Neon, Clerk, Stripe (test sandbox), Railway, Vercel, Anthropic, OpenAI credentials stored in `.env` files (chmod 600) — locations and names only, not values.
 
 ## Status
-- **Live Deployments [2026-08-15]:** Web is live at `https://mymation.vercel.app` (Vercel, auto-deploys on push to main); API is hosted at `https://api-production-6a94.up.railway.app`.
-- **Milestones:** M0 through M4, plus M5 part 1 deployed (landing page, admin metrics, usage cache columns). 
-- **Recent PRs:** PR #9 (Stripe webhook foreign-event guard), PR #10 (memory delta cards fade out ~1.5s after resolve), and PR #11 (Nikki help widget and `/help/ask` API) [2026-08-15]. M4 fully implements memory provenance history and resolution panels.
-- **DNS Cutover [2026-08-15 / 2026-09-03]:** `mymation.com` is managed on Squarespace DNS. CNAME `app` points to Vercel (LIVE). API custom domain recreated via GraphQL with target `4u8mx433.up.railway.app` (Squarespace CNAME update pending).
+- **Live (test mode: Clerk dev + Stripe sandbox) [app, 2026-08-15]:**
+  - web: `https://mymation.vercel.app` (Vercel, auto-deploys on push to main)
+  - api: `https://api-production-6a94.up.railway.app` (`/healthz`, `/readyz`)
+- **Milestones deployed:** M0–M4 + M5 part 1 (landing page, `/admin/metrics` gated by `ADMIN_EMAILS`, 10/min burst limit, migration 002 usage cache cols).
+- **Recent PRs:**
+  - PR #9: Stripe webhook foreign-event guard (see Integrations above).
+  - PR #10: memory delta cards fade out ~1.5s after resolve (previously stuck in transcript forever).
+  - PR #11: Nikki help widget + Help Center + `/help/ask` API (see Key logic above) [app, 2026-08-15].
+- **M4:** `GET /memory/facts/{id}/history` provenance endpoint; Memory page "why?" panels and pending-card resolution — complete.
+- **DNS cutover:**
+  - (2026-08-15) `mymation.com` is on Squarespace DNS (same login as another Stan property, "mygoldenfinance"; verify codes are emailed to Stan and he pastes them in; the DNS modal is shadow-DOM, so use coordinate clicks). CNAME `app` → Vercel is LIVE and verified. Desktop site keeps the `www` subdomain.
+  - (2026-09-03) `api` CNAME: the original Railway target (`3f12ix0s`) sat in `CERTIFICATE_STATUS_TYPE_ISSUING` for weeks despite DNS propagation and no CAA issue — fixed by deleting and recreating the custom domain via GraphQL (`customDomainCreate`, which also needs `projectId`). New required target is `4u8mx433.up.railway.app`; Squarespace CNAME still needs to be updated to point there. Check status via: `service(id){serviceInstances{edges{node{domains{customDomains{status{dnsRecords{...} certificateStatus}}}}}}}`.
+  - Remaining cutover work: api SSL cert, Clerk production instance (new keys + Clerk DNS CNAMEs, needs Stan/dashboard access), Stripe live keys (Stan to provide), and env swaps (`FRONTEND_ORIGIN`, `NEXT_PUBLIC_API_URL` → `https://api.mymation.com`, Clerk/Stripe keys).
 
 ## Gotchas & lessons
-- **Railway Deployments:** Railway does *not* auto-deploy on push. Deployments must be triggered via GraphQL (`https://backboard.railway.app/graphql/v2`) using `Authorization: Bearer $RAILWAY_TOKEN` and a required User-Agent header (otherwise 403). Use `serviceInstanceDeployV2(serviceId, environmentId, commitSha)` because plain `serviceInstanceDeploy` redeploys old commits and can return "Not Authorized". Poll `deployment(id)` to verify the deployed SHA matches `origin/main`.
-- **Railway Configuration:** Requires `NIXPACKS_UV_VERSION=0.8.11` to prevent the Nixpacks empty-version pip bug. Project, environment, and service IDs live in secrets files (`RAILWAY_PROJECT_ID`, `RAILWAY_ENV_ID`, `RAILWAY_SERVICE_ID`). Note that the `variables` GraphQL query returns "Not Authorized" with tokens, but `variableUpsert` succeeds.
-- **Python & Stripe:** In `stripe-python` 15.x, `event["data"]["object"]` is a `StripeObject` (not a plain dict and lacks `.get`)—always call `.to_dict()` first. Test webhook handlers using `stripe.Event.construct_from(...)` rather than plain dictionaries to avoid silent failures.
-- **Development Environment:** Prior to using `uv`, run `export UV_PROJECT_ENVIRONMENT=.venv; unset VIRTUAL_ENV`. Backend tests are run via `cd api && uv run pytest`, and frontend builds via `cd web && npm run build`. Anthropic model IDs must be queried via `/v1/models` as `-latest` aliases may not exist.
+- **Railway deploys:** Railway does NOT auto-deploy on push. Trigger via GraphQL at `https://backboard.railway.app/graphql/v2` with `Authorization: Bearer $RAILWAY_TOKEN` AND a User-Agent header (otherwise 403).
+- Use `serviceInstanceDeployV2(serviceId, environmentId, commitSha)` — plain `serviceInstanceDeploy` redeploys the OLD commit and sometimes returns "Not Authorized". Poll `deployment(id)` for status + `meta.commitHash`; verify the deployed SHA matches `origin/main`.
+- Railway env var `NIXPACKS_UV_VERSION=0.8.11` is required (works around a nixpacks empty-version pip bug).
+- Railway secrets env var names are `RAILWAY_PROJECT_ID` / `RAILWAY_ENV_ID` / `RAILWAY_SERVICE_ID` (not `PROJECT_ID`) — these IDs live in Railway/Vercel secrets env files. Note: the `variables` GraphQL query returns "Not Authorized" with this token, but `variableUpsert` works fine.
+- **Repo dev setup:** Before using `uv` in the repo: `export UV_PROJECT_ENVIRONMENT=.venv; unset VIRTUAL_ENV`. Backend tests: `cd api && uv run pytest`. Frontend: `cd web && npm run build`. Validate migration SQL with `pglast`. Query Anthropic model IDs via `/v1/models` since `-latest` aliases may not exist for a given key.
+- **Stripe library gotcha:** In `stripe-python` 15.x, `event["data"]["object"]` is a `StripeObject`, not a dict (no `.get`) — call `.to_dict()` first. Test webhook handlers with a real `stripe.Event.construct_from(...)`, not plain dicts — that's how the M1 webhook 500 error slipped through undetected.
 
 ## Open items
-- Complete remaining DNS cutover steps (update Squarespace CNAME for the API domain to `4u8mx433.up.railway.app`).
-- Finalize production cutover items: API SSL certificate, Clerk production instance (new keys and Clerk DNS CNAMEs), Stripe live keys, and environment variable updates (`FRONTEND_ORIGIN`, `NEXT_PUBLIC_API_URL` pointing to `https://api.mymation.com`).
-- Execute the migration of app infrastructure from the old platform host to Stan's own GitHub + Firebase Hosting + Convex account.
+- Update the Squarespace CNAME for the `api` subdomain to point to `4u8mx433.up.railway.app` and confirm the certificate issues correctly.
+- Finish production cutover: API SSL cert, Clerk production instance (new keys + DNS CNAMEs — needs Stan/dashboard), Stripe live keys (needs Stan), and env swaps (`FRONTEND_ORIGIN`, `NEXT_PUBLIC_API_URL`, Clerk/Stripe keys).
+- Keep help articles (`web/src/content/helpArticles.ts`) in sync with new features as they ship.
+- Re-run the M3 reflection golden eval after any future reflection-prompt change to confirm zero false cards.

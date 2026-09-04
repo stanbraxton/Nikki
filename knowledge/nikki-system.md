@@ -1,69 +1,65 @@
-# Nikki — architecture, operations and roadmap
+# Nikki — architecture, infra, deploy, gotchas
 
-Nikki is Stan Braxton's standalone AI assistant and engineer, running on his own Google Cloud project. It is being
-built into a sellable multi-tenant SaaS under the standalone "Nikki" brand. This document is Nikki's own
-operating manual.
+Nikki is Stan Braxton's standalone private AI assistant and engineer, running on his own Google Cloud project (`nikkiaia-prod`, region `us-east4`, domain `nikkiaia.com`). This document serves as your complete operating manual, capturing architecture, deployment, engineering workflows, tools, and maintenance rules.
 
-## Stack
-- **UI**: Chainlit 2.x mounted at `/` inside a FastAPI app (`app/main.py`, `app/ui.py`). Real-time token streaming,
-  expandable reasoning/tool steps, approval gates (Approve/Reject) before gated tools run.
-- **Changing my own UI**: I CAN edit my own interface. The chat UI is Chainlit, customized via `.chainlit/config.toml`
-  (`[[UI.header_links]]` = top-header links, currently Integrations + Schedules), `public/nikki.js` (admin-only Admin/Spaces
-  links injected into the top header, signup link on /login) and `public/nikki.css`. The other pages (/admin, /spaces,
-  /integrations, /schedules, /signup) are plain HTML in `app/`. Workflow: edit + commit + push to `stanbraxton/Nikki`
-  main, then tell Stan the change is committed and needs a redeploy of the `nikki` Cloud Run service (I cannot redeploy
-  myself). Never tell Stan a UI change is impossible.
-- **Agent**: LangGraph ReAct agent (`app/agent.py`), default model `anthropic:claude-sonnet-4-5`, switchable to
-  OpenAI in settings. Graph is rebuilt from the tool registry after every interrupt so hot-loaded skills bind.
-- **Tools** (`app/tools/`): files (workspace-sandboxed), db_schema/db_query/db_execute, self-maintenance
-  (`write_skill` — AST + import checks + trial import, then hot-load), web (search + fetch with SSRF guard), memory
-  (remember/recall/forget), Google Workspace (Drive, Calendar; Gmail admin only), Microsoft 365, custom REST APIs,
-  scheduler, Spaces (single-file micro-apps on Cloud Run), **engineer** (git repos → Cloud Build → Firebase Hosting +
-  Convex) and **knowledge base** (this folder).
-- **Persistence**: Cloud SQL Postgres (`nikki-pg`, db/user `nikki`) — LangGraph checkpoints, Chainlit threads, traces,
-  memories, spaces, apps/builds, tenants/accounts/integrations. GCS bucket mounted at `/mnt/data` for workspace files,
-  user skills and the knowledge-base overlay.
-- **Auth**: own email/username + password (bcrypt). Admin tenant `admin` (user `stan`). Customer sign-up at `/signup`
-  is gated by an invite code (`SIGNUP_CODE`). Every tool call is scoped by a tenant ContextVar (`app/tenancy.py`).
-- **Integrations** (`app/integrations/`): OAuth providers google, microsoft; api-key providers tavily, custom_rest.
-  Tenant page `/integrations`; admin page `/admin` (provider client credentials, tenant list). Tokens are
-  Fernet-encrypted at rest.
-- **Scheduler**: Cloud Scheduler jobs `nikki-sched-*` call `POST /api/run` (OIDC from `nikki-scheduler@`), results at
-  `/schedules`.
+## Overview & Source of Truth
 
-## Cloud footprint (project `nikkiaia-prod`, region us-east4)
-- Cloud Run service `nikki` (1 vCPU / 1 GiB, min 1 instance, session affinity), runtime SA `nikki-runtime@`.
-- Domain https://nikkiaia.com (Google-managed cert; DNS at Squarespace). Fallback https://nikki-895240122598.us-east4.run.app.
-  The Google front end 404s `/healthz` — probe with `POST /api/run` (expects 401) or a logged-in `GET /api/me`.
-- Secrets (Secret Manager): ANTHROPIC_API_KEY, OPENAI_API_KEY, ADMIN_PASSWORD_HASH, CHAINLIT_AUTH_SECRET,
-  ADMIN_API_TOKEN, DATABASE_URL, GOOGLE_OAUTH_CLIENT_ID/SECRET, TAVILY_API_KEY (placeholder), GITHUB_TOKEN
-  (placeholder until Stan adds a token), `nikki-app-{slug}-convex` per registered app.
-- Google OAuth consent screen: In production, External, 100-user lifetime cap for unverified sensitive scopes → brand
-  verification needed before ~100 customers connect Google. [2026-09-04]
-- Deploy: `PROJECT=nikkiaia-prod REGION=us-east4 DOMAIN=nikkiaia.com bash scripts/deploy.sh` (Cloud Build → Cloud Run).
-  Infra bootstrap in `scripts/infra.sh`. Source of truth: GitHub `stanbraxton/Nikki` (private).
+- **Source Repo**: `https://github.com/stanbraxton/Nikki` (private, branch `main`; local clone set up). Commit and push via `coworker_git` after every shipped change [github, 2026-09-03].
+- **Standalone Product**: Independent of any legacy infrastructure. Uses Stan's GCP account and his Anthropic/OpenAI keys. Purchases and production deployments require Stan's explicit approval.
 
-## Engineer workflow (how Nikki maintains software)
-1. `repo_open owner/name` → read with `repo_list`/`repo_read`/`repo_search`.
-2. Edit with `repo_edit` (exact snippet) or `repo_write`; check `repo_git diff`; run small checks with `repo_run`
-   (typecheck/lint/unit tests only — no full builds, the container has 1 GiB).
-3. `repo_commit_push` (gated) with a clear message.
-4. `deploy_app slug` (gated): snapshots committed HEAD → Cloud Build (bun install → `convex deploy --cmd 'bun run build'`
-   → `firebase deploy --only hosting`). Follow with `app_status`; don't poll in a loop.
-5. Apps are registered once with `register_app` (repo, Firebase site, optional Convex production deploy key which is
-   stored in Secret Manager). Custom domains via `add_custom_domain` (returns DNS records for Stan).
-Working trees live in `/tmp/repos` and may vanish when the instance recycles — `repo_open` re-clones; nothing is
-lost because GitHub is the source of truth. Never deploy with uncommitted changes.
+## Technical Stack
 
-## Roadmap
-- **Phase B (SaaS)**: safe tenant tools, Stripe billing (never per-seat), usage metering, admin dashboard.
-- **Phase C**: landing page, onboarding, Google brand verification (+ CASA if Gmail goes public), Spaces for tenants.
-- **Migration**: move Stan's 11 web apps and 5 static pages from the old platform to GitHub + Firebase Hosting +
-  his own Convex account, then maintain them through the engineer toolchain (see project-* documents).
+- **API & UI (`app/main.py`, `app/ui.py`)**: FastAPI (`/healthz`, `/api/traces/{thread}`, `/api/skills` protected by bearer `ADMIN_API_TOKEN`) with Chainlit 2.12 mounted at `/`.
+- **Agent (`app/agent.py`)**: LangGraph `create_react_agent`, with `interrupt_before=["tools"]` and `interrupt_after=["tools"]`. The graph is rebuilt from `registry.tools()` after every interrupt so hot-loaded tools bind correctly to the model. Default model is `anthropic:claude-sonnet-4-5`, switchable to OpenAI in settings.
+- **Tools (`app/tools/`)**: Registry-managed. Approval is determined by `tool.metadata["requires_approval"]`. Built-in tools include workspace-sandboxed file operations, read-only/gated database queries (`db_schema`, `db_query`, `db_execute`), self-maintenance (`write_skill` validates via AST and trial import before hot-loading), web search/fetch with SSRF guards, memory management, Google Workspace, Microsoft Graph, custom REST APIs, scheduler, micro-spaces deployment, engineer toolchain, and knowledge base access.
+- **Persistence (`app/persistence.py`)**: Cloud SQL Postgres (`nikki-pg`, user/db `nikki`) for LangGraph checkpointers, traces, memories, spaces, apps, builds, tenants, accounts, and integrations. A GCS bucket volume is mounted at `/mnt/data` for workspace files, user skill modules, and knowledge-base overlays.
+- **Auth & Tenancy**: Chainlit password auth using bcrypt `ADMIN_PASSWORD_HASH` (`scripts/hash_password.py`), requiring `CHAINLIT_AUTH_SECRET`. Customer sign-up at `/signup` requires an invite code (`SIGNUP_CODE`) and defaults to `status="pending"` until approved by an admin. Every tool and persistence call is scoped by a tenant ContextVar (`app/tenancy.py`).
+- **Integrations (`app/integrations/`)**: OAuth providers for Google and Microsoft, plus API-key providers for Tavily and custom REST. Managed via the `/integrations` self-service page and the `/admin` panel. OAuth tokens are Fernet-encrypted at rest (`app/crypto.py`).
 
-## Lessons
-- Secret Manager refuses empty payloads; optional secrets hold a single newline and code treats whitespace as unset.
-- Cloud Run `gcloud run deploy --source` from a service account needs more IAM than documented (bucket-scoped
-  storage.admin on `run-sources-*`, a custom bucket-list role, serviceAccountUser on the compute default SA).
-- Managed certificates can take 60+ minutes after DNS is correct; don't loop-poll.
-- Stan's rule: no references to the previous assistant platform anywhere in his software.
+## Infrastructure & Deployment
+
+- **Infrastructure Scripts**: `scripts/infra.sh` provisions APIs, runtime service accounts, Artifact Registry repositories, GCS bucket volumes, empty secrets, Cloud SQL `db-f1-micro` (`nikki-pg`), and Cloud DNS zones. `scripts/deploy.sh` drives Cloud Build to Cloud Run, mounts GCS at `/mnt/data`, attaches secrets, and configures domain mapping. The gcloud CLI operates from `/tools/google-cloud-sdk/bin/gcloud`.
+- **Cloud Run Service**: Live at `https://nikkiaia.com` (Google-managed certificate, issued 20:47 UTC; takes ~70 min after DNS resolution) and `https://nikki-895240122598.us-east4.run.app`.
+- **Domain & DNS**: `nikkiaia.com` maps to Cloud Run with `CertificateProvisioned` and `DomainRoutable True`. DNS is hosted at Squarespace with standard A and AAAA records.
+- **Deploy Command**: 
+  ```bash
+  PROJECT=nikkiaia-prod REGION=us-east4 DOMAIN=nikkiaia.com bash scripts/deploy.sh
+  ```
+  *(Note: `deploy.sh` builds the working tree, not HEAD. Always check `git status` and stash or commit stray files before deploying.)*
+
+## Gotchas & Troubleshooting
+
+- **Health Probes**: The Google front end returns its own 404 for `/healthz` on `*.run.app` and `nikkiaia.com`, and `/healthz/` falls through to Chainlit HTML. Probe production health using `POST /api/run` (which returns 401 without auth) or an authenticated `GET /api/schedules`.
+- **Secret Manager**: Running `printf '' | gcloud secrets versions add` creates no version and causes Cloud Run deployments to fail. Optional secrets are seeded with a single newline (`"\n"`), and application code treats whitespace-only secret values as unset.
+- **gcloud Configuration**: gcloud configuration is located at `CLOUDSDK_CONFIG=/tools/.gcloud`. Always export `CLOUDSDK_CONFIG` and update `PATH` when executing manual gcloud commands.
+- **Process Killing**: Never use `pkill -f` or `pgrep -f` with a pattern matching your own command line, as it will kill the calling shell (exit status 143). Always terminate background processes by PID from log files.
+- **Beta Components**: Running `gcloud beta ...` prompts for interactive component installation and hangs non-interactive shells. Run `gcloud components install beta -q` beforehand.
+- **Domain Verification**: The Site Verification API requires a separate OAuth scope; user credentials receive 403 errors, so domain verification must be completed by Stan in a browser.
+
+## Core Engines & Capabilities
+
+### Spaces Engine (v2)
+- Deploy micro-apps to Cloud Run via `app/tools/spaces.py` (`deploy_space`, `space_status`, `list_spaces`, `delete_space`). Asynchronous execution returns "queued" while gcloud runs in a thread, updating the `spaces` Postgres table.
+- Accessible via the `/spaces` gallery (`app/spaces_gallery.py`) and monitored live in the chat UI via `watch_space` status cards.
+- Services are named `nikki-space-{slug}`, deployed in `us-east4` under zero-role service account `nikki-spaces@`, labeled `managed-by=nikki`.
+
+### Web, Google Workspace, Scheduler & Memory (v3)
+- **Web (`app/tools/web.py`)**: `web_search` uses Tavily if configured or falls back to DuckDuckGo; `http_fetch` blocks private, loopback, and link-local IP addresses.
+- **Memory (`app/tools/memory.py`)**: Managed via the `memories` table. Remember and recall operations are ungated; forget is gated. A digest of up to 60 recent memories is injected into your system prompt.
+- **Scheduler (`app/scheduler.py`, `app/headless.py`)**: `POST /api/run` triggers background tasks logged to `scheduled_runs`. Cloud Scheduler jobs (`nikki-sched-{name}`) invoke `/api/run` using OIDC authentication from `nikki-scheduler@`.
+
+### Multi-Tenant SaaS & Engineer Toolchain (v4 / v5)
+- **Tenancy**: Scoped via `app/tenancy.py`. Admin tenant is `"admin"`. Tenant self-service signup requires approval via the admin dashboard (`/admin`).
+- **Engineer Toolchain (`app/tools/engineer.py`)**: Allows you to manage GitHub repositories, run lint/type checks, and deploy applications (`deploy_app`) by snapshotting committed HEAD to Cloud Build, running dependency installation, optional Convex deployment, and Firebase Hosting deployment (`firebase-tools@14 deploy --only hosting`).
+- **Knowledge Base (`app/tools/knowledge.py`)**: Manages Markdown documents in the repository `knowledge/` directory and overlay storage at `/mnt/data/knowledge`. The index is automatically injected into your system prompt.
+
+## UI Customization & Brand Assets
+
+- **Changing Your Own UI**: You CAN edit your own interface. The chat UI is built with Chainlit, configured via `.chainlit/config.toml` (`[[UI.header_links]]`), `public/nikki.js` (which injects admin header links), and `public/nikki.css`. Other pages (`/admin`, `/spaces`, `/integrations`, `/schedules`, `/signup`) are static HTML files in `app/`. Workflow: edit, commit, and push changes to `stanbraxton/Nikki`, then inform Stan that a redeployment of the Cloud Run service is required. Never state that a UI change is impossible.
+- **Brand Assets**: Asset generation script `scripts/brand_assets.py` (using PIL and Lato-Bold) maintains avatars, favicons, app touch icons, and header lockups using the Nicole cartoon avatar source asset. Custom HTML pages include proper favicon links and avatar headings.
+
+## Maintenance, History Repair & Knowledge Base Sync
+
+- **Repository Commits**: Always execute `git fetch` and rebase on `origin/main` before pushing. Push changes using `coworker_git` with argument lists (e.g., `coworker_git(["fetch","origin"], working_dir)`), which automatically re-authors commits under Stan's identity.
+- **History Repair Hook**: To prevent Anthropic 400 errors caused by interleaved turns or interrupted tool approvals, `app/agent.py` includes `repair_history()` and a `_pre_model_hook` that strips orphan tool results and synthesizes error messages. Concurrent messages are handled via per-thread asyncio locks in `app/ui.py`.
+- **Knowledge Base Sync**: You hold all project knowledge as well as private records (health, financial, legal, and family categories). Business and project documents reside in the repository `knowledge/` directory and overlay; private documents are stored exclusively in the secure overlay (`gs://nikkiaia-prod-nikki-data/knowledge/`), prefixed with '_Private — for Stan only_'. You must never disclose private records outside direct conversations with Stan. Use `skills/nikki/scripts/kb_sync.py` to synchronize knowledge base assets.
