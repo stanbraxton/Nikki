@@ -9,7 +9,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from sqlalchemy import select
 
 from app import persistence
-from app.google_oauth import router as google_router
+from app.auth import router as auth_router
+from app.integrations.routes import router as integrations_router
 from app.legal import router as legal_router
 from app.scheduler import router as scheduler_router
 from app.spaces_gallery import router as spaces_router
@@ -23,11 +24,14 @@ log = logging.getLogger("nikki")
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await persistence.init_db()
-    log.info("tools loaded: %s", [t.name for t in registry.tools()])
+    from app.auth import ensure_admin
+
+    await ensure_admin()
+    log.info("tools loaded: %s", [t.name for t in registry.tools(admin=True)])
     yield
 
 
-app = FastAPI(title="Nikki", version="0.3.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(title="Nikki", version="0.4.0", lifespan=lifespan, docs_url=None, redoc_url=None)
 
 
 def _admin(authorization: str = Header(default="")) -> None:
@@ -41,7 +45,7 @@ def _admin(authorization: str = Header(default="")) -> None:
 
 @app.get("/healthz")
 async def healthz() -> dict:
-    return {"ok": True, "env": settings.env, "tools": len(registry.tools())}
+    return {"ok": True, "env": settings.env, "tools": len(registry.tools(admin=True)), "version": "0.4.0"}
 
 
 @app.get("/api/traces/{thread_id}", dependencies=[Depends(_admin)])
@@ -60,7 +64,8 @@ async def skills() -> list[dict]:
 
 
 app.include_router(spaces_router)
-app.include_router(google_router)
+app.include_router(auth_router)
+app.include_router(integrations_router)
 app.include_router(scheduler_router)
 app.include_router(legal_router)
 

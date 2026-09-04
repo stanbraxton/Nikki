@@ -23,12 +23,20 @@ default_theme = "dark"
 layout = "default"
 cot = "full"
 custom_css = "/public/nikki.css"
+custom_js = "/public/nikki.js"
 
 [[UI.header_links]]
-    name = "Spaces"
-    display_name = "Spaces Gallery"
-    icon_url = "/public/spaces.svg"
-    url = "/spaces"
+    name = "Integrations"
+    display_name = "Integrations"
+    icon_url = "/public/plug.svg"
+    url = "/integrations"
+    target = "_self"
+
+[[UI.header_links]]
+    name = "Schedules"
+    display_name = "Schedules"
+    icon_url = "/public/clock.svg"
+    url = "/schedules"
     target = "_self"
 
 [meta]

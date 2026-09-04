@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from chainlit.auth import get_current_user
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import select
 
 from app import persistence
+from app.auth import require_admin
 
 router = APIRouter()
 
@@ -33,10 +33,8 @@ async def _rows() -> list[dict[str, Any]]:
 
 
 @router.get("/api/spaces")
-async def api_spaces(user=Depends(get_current_user)) -> list[dict]:
-    """Gallery data. Requires the chat login cookie; 401 otherwise."""
-    if user is None:
-        raise HTTPException(status_code=401)
+async def api_spaces(_=Depends(require_admin)) -> list[dict]:
+    """Gallery data. Admin login cookie required (401/403 otherwise)."""
     return await _rows()
 
 

@@ -7,7 +7,6 @@ import logging
 import re
 from typing import Any
 
-import bcrypt
 import chainlit as cl
 from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 from chainlit.input_widget import Select
@@ -16,6 +15,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Too
 from app import persistence
 from app.agent import build_graph, pending_tool_calls, rejection_messages, text_of
 from app.config import settings
+from app.tenancy import Principal, set_principal
 from app.tools import registry
 
 log = logging.getLogger("nikki.ui")
@@ -85,14 +85,22 @@ def _data_layer():
 
 # ---------------------------------------------------------------- auth
 @cl.password_auth_callback
-def auth(username: str, password: str) -> cl.User | None:
-    if not settings.admin_password_hash:
-        log.error("ADMIN_PASSWORD_HASH is not set; refusing all logins")
+async def auth(username: str, password: str) -> cl.User | None:
+    from app.auth import authenticate
+
+    p = await authenticate(username, password)
+    if p is None:
         return None
-    ok = username == settings.admin_username and bcrypt.checkpw(
-        password.encode(), settings.admin_password_hash.encode()
-    )
-    return cl.User(identifier=username, metadata={"role": "admin"}) if ok else None
+    return cl.User(identifier=p.email, metadata={"role": p.role, "tenant_id": p.tenant_id, "email": p.email})
+
+
+def _principal() -> Principal:
+    from app.auth import principal_of
+
+    p = principal_of(cl.user_session.get("user"))
+    if p is None:
+        raise RuntimeError("no authenticated user in session")
+    return p
 
 
 # ---------------------------------------------------------------- session
@@ -104,12 +112,14 @@ async def _settings_panel() -> None:
 
 @cl.on_chat_start
 async def on_start() -> None:
+    set_principal(_principal())
     cl.user_session.set("model", settings.model)
     await _settings_panel()
 
 
 @cl.on_chat_resume
 async def on_resume(thread: dict) -> None:
+    set_principal(_principal())
     cl.user_session.set("model", (thread.get("metadata") or {}).get("model", settings.model))
     await _settings_panel()
 
@@ -225,6 +235,7 @@ async def stream_segment(graph, config: dict, inp: Any, r: TurnRenderer) -> None
 # ---------------------------------------------------------------- main turn
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
+    set_principal(_principal())
     thread_id = cl.context.session.thread_id
     model = cl.user_session.get("model") or settings.model
     await persistence.trace(thread_id, "user", {"text": message.content, "model": model})

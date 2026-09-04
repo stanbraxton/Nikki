@@ -69,8 +69,21 @@ def http_fetch(url: str, max_chars: int = MAX_CHARS) -> str:
     return head + body
 
 
+def _tavily_key() -> str | None:
+    """Tenant's Tavily connection first, then the platform-wide env key."""
+    try:
+        from app.integrations import store
+
+        conns = store.connections("tavily")
+        if conns:
+            return store.secret_for("tavily", conns[0]["label"])[0]
+    except Exception:  # noqa: BLE001 — no tenant context / table yet
+        pass
+    return (os.environ.get("TAVILY_API_KEY") or "").strip() or None
+
+
 def _tavily(query: str, n: int) -> str | None:
-    key = (os.environ.get("TAVILY_API_KEY") or "").strip() or None
+    key = _tavily_key()
     if not key:
         return None
     r = httpx.post(

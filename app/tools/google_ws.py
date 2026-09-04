@@ -1,4 +1,4 @@
-"""Gmail and Google Drive tools backed by the accounts linked at /connect/google.
+"""Gmail, Google Drive and Google Calendar tools backed by the Google connections on /integrations (per tenant).
 Read tools run without approval; anything that sends or creates content is gated."""
 from __future__ import annotations
 
@@ -9,14 +9,14 @@ from html import unescape
 from typing import Any
 
 from langchain_core.tools import tool
-from sqlalchemy import create_engine, select
 
-from app import google_oauth
-from app import persistence
-from app.config import settings
 
-_eng = None
-_creds: dict[str, Any] = {}
+from app.integrations import store
+from app.tenancy import tenant_id
+
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+
+_creds: dict[tuple[str, str], Any] = {}
 
 EXPORT = {  # Google-native types -> export MIME
     "application/vnd.google-apps.document": "text/plain",
@@ -26,49 +26,28 @@ EXPORT = {  # Google-native types -> export MIME
 TEXT_LIKE = ("text/", "application/json", "application/xml", "application/csv")
 
 
-def _e():
-    global _eng
-    if _eng is None:
-        _eng = create_engine(settings.sqlalchemy_sync_url, pool_pre_ping=True, pool_size=2, max_overflow=2)
-    return _eng
-
-
 def _accounts() -> list[str]:
-    t = persistence.google_tokens
-    with _e().connect() as c:
-        return [r[0] for r in c.execute(select(t.c.email).order_by(t.c.created_at))]
+    return [c["label"] for c in store.connections("google")]
 
 
 def _resolve(account: str) -> str:
-    accts = _accounts()
-    if not accts:
-        raise RuntimeError("no Google account linked — ask the user to open /connect/google")
-    if not account:
-        if len(accts) == 1:
-            return accts[0]
-        raise RuntimeError("several accounts are linked; pass account=<email>: " + ", ".join(accts))
-    account = account.lower()
-    hits = [a for a in accts if a == account or a.startswith(account)]
-    if len(hits) != 1:
-        raise RuntimeError(f"account {account!r} not linked; linked: " + ", ".join(accts))
-    return hits[0]
+    return store.resolve_label("google", account)
 
 
 def _credentials(email: str):
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
 
-    cred = _creds.get(email)
+    key = (tenant_id(), email)
+    cred = _creds.get(key)
     if cred is None:
-        t = persistence.google_tokens
-        with _e().connect() as c:
-            row = c.execute(select(t.c.refresh_token, t.c.scopes).where(t.c.email == email)).first()
-        if not row:
-            raise RuntimeError(f"no token for {email}")
-        cred = Credentials(None, refresh_token=row[0], token_uri=google_oauth.TOKEN_URL,
-                           client_id=google_oauth.client_id(), client_secret=google_oauth.client_secret(),
-                           scopes=row[1].split() or None)
-        _creds[email] = cred
+        refresh, row = store.secret_for("google", email)
+        cc = store.client_credentials("google")
+        if not cc:
+            raise RuntimeError("Google provider is not configured by the administrator")
+        cred = Credentials(None, refresh_token=refresh, token_uri=TOKEN_URL, client_id=cc[0], client_secret=cc[1],
+                           scopes=(row.get("scopes") or "").split() or None)
+        _creds[key] = cred
     if not cred.valid:
         cred.refresh(Request())
     return cred
@@ -114,7 +93,7 @@ def google_accounts() -> str:
     """List the Google accounts linked to Nikki (Gmail + Drive access)."""
     accts = _accounts()
     if not accts:
-        return "No Google account linked. Ask the user to open /connect/google while logged in."
+        return "No Google account linked. Ask the user to open /integrations and connect Google while logged in."
     return "Linked Google accounts:\n" + "\n".join(f"- {a}" for a in accts)
 
 
@@ -258,9 +237,51 @@ def drive_create_doc(title: str, content: str, account: str = "", folder_id: str
         return f"error: {type(e).__name__}: {e}"
 
 
-for _t in (google_accounts, gmail_search, gmail_read, drive_search, drive_read):
+
+@tool
+def gcal_list_events(days: int = 7, account: str = "", calendar_id: str = "primary", query: str = "") -> str:
+    """List upcoming Google Calendar events for the next `days` days (default 7). Optional free-text query."""
+    from datetime import datetime, timedelta, timezone as tz
+
+    try:
+        email = _resolve(account)
+        svc = _svc(email, "calendar", "v3")
+        now = datetime.now(tz.utc)
+        res = svc.events().list(calendarId=calendar_id, timeMin=now.isoformat(), timeMax=(now + timedelta(days=max(1, min(days, 90)))).isoformat(),
+                                singleEvents=True, orderBy="startTime", maxResults=50, q=query or None).execute()
+    except Exception as e:  # noqa: BLE001
+        return f"error: {e}"
+    items = res.get("items", [])
+    if not items:
+        return f"no events in the next {days} days ({email})"
+    out = [f"Events for {email}:"]
+    for ev in items:
+        st = ev.get("start", {}); when = st.get("dateTime") or st.get("date")
+        out.append(f"- {when} — {ev.get('summary', '(no title)')}" + (f" @ {ev['location']}" if ev.get("location") else "") + f" [id {ev['id']}]")
+    return "\n".join(out)
+
+
+@tool
+def gcal_create_event(title: str, start: str, end: str, account: str = "", description: str = "", location: str = "",
+                      attendees: str = "", calendar_id: str = "primary", timezone: str = "America/New_York") -> str:
+    """Create a Google Calendar event. start/end are ISO 8601 (e.g. 2026-09-10T14:00:00); attendees = comma-separated emails. Requires approval."""
+    try:
+        email = _resolve(account)
+        svc = _svc(email, "calendar", "v3")
+        body = {"summary": title, "description": description or None, "location": location or None,
+                "start": {"dateTime": start, "timeZone": timezone}, "end": {"dateTime": end, "timeZone": timezone}}
+        if attendees.strip():
+            body["attendees"] = [{"email": a.strip()} for a in attendees.split(",") if a.strip()]
+        ev = svc.events().insert(calendarId=calendar_id, body=body, sendUpdates="all" if attendees.strip() else "none").execute()
+    except Exception as e:  # noqa: BLE001
+        return f"error: {e}"
+    return f"created event '{title}' {start} → {end} ({email}): {ev.get('htmlLink', '')}"
+
+
+for _t in (google_accounts, gmail_search, gmail_read, drive_search, drive_read, gcal_list_events):
     _t.metadata = {"requires_approval": False}
-for _t in (gmail_send, drive_create_doc):
+for _t in (gmail_send, drive_create_doc, gcal_create_event):
     _t.metadata = {"requires_approval": True}
 
-TOOLS = [google_accounts, gmail_search, gmail_read, gmail_send, drive_search, drive_read, drive_create_doc]
+TOOLS = [google_accounts, gmail_search, gmail_read, gmail_send, drive_search, drive_read, drive_create_doc, gcal_list_events, gcal_create_event]
+GMAIL_TOOLS = {"gmail_search", "gmail_read", "gmail_send"}

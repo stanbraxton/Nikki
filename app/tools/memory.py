@@ -12,6 +12,7 @@ from sqlalchemy import create_engine, delete, insert, or_, select, update
 
 from app import persistence
 from app.config import settings
+from app.tenancy import tenant_id
 
 KINDS = ("fact", "preference", "project", "person", "other")
 DIGEST_LIMIT = 60
@@ -47,12 +48,12 @@ def remember(content: str, kind: str = "fact") -> str:
     kind = kind if kind in KINDS else "other"
     m = persistence.memories
     with _e().begin() as c:
-        dup = c.execute(select(m.c.id).where(m.c.content == content)).first()
+        dup = c.execute(select(m.c.id).where(m.c.tenant_id == tenant_id(), m.c.content == content)).first()
         if dup:
             c.execute(update(m).where(m.c.id == dup[0]).values(updated_at=_now(), kind=kind))
             return f"already known (refreshed) [{dup[0][:8]}]"
         mid = str(uuid.uuid4())
-        c.execute(insert(m).values(id=mid, kind=kind, content=content[:1000], created_at=_now(), updated_at=_now()))
+        c.execute(insert(m).values(id=mid, tenant_id=tenant_id(), kind=kind, content=content[:1000], created_at=_now(), updated_at=_now()))
     return f"remembered [{mid[:8]}] ({kind}): {content}"
 
 
@@ -60,7 +61,7 @@ def remember(content: str, kind: str = "fact") -> str:
 def recall(query: str = "", kind: str = "", limit: int = 20) -> str:
     """Search long-term memory. Empty query lists the most recent memories. Optional kind filter."""
     m = persistence.memories
-    stmt = select(m).order_by(m.c.updated_at.desc()).limit(max(1, min(int(limit), 100)))
+    stmt = select(m).where(m.c.tenant_id == tenant_id()).order_by(m.c.updated_at.desc()).limit(max(1, min(int(limit), 100)))
     words = [w for w in query.split() if len(w) > 2][:8]
     if words:
         stmt = stmt.where(or_(*[m.c.content.ilike(f"%{w}%") for w in words]))
@@ -78,7 +79,7 @@ def forget(memory_id: str) -> str:
     """Delete a memory by its id (the 8-char prefix shown by recall is enough). Requires approval."""
     m = persistence.memories
     with _e().begin() as c:
-        rows = c.execute(select(m.c.id, m.c.content).where(m.c.id.like(f"{memory_id}%"))).fetchall()
+        rows = c.execute(select(m.c.id, m.c.content).where(m.c.tenant_id == tenant_id(), m.c.id.like(f"{memory_id}%"))).fetchall()
         if not rows:
             return f"no memory with id starting {memory_id!r}"
         if len(rows) > 1:
@@ -92,7 +93,7 @@ def memory_digest() -> str:
     try:
         m = persistence.memories
         with _e().connect() as c:
-            rows = c.execute(select(m).order_by(m.c.updated_at.desc()).limit(DIGEST_LIMIT)).fetchall()
+            rows = c.execute(select(m).where(m.c.tenant_id == tenant_id()).order_by(m.c.updated_at.desc()).limit(DIGEST_LIMIT)).fetchall()
     except Exception:  # noqa: BLE001
         return ""
     out, size = [], 0

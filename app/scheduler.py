@@ -17,6 +17,8 @@ from pydantic import BaseModel
 from sqlalchemy import select, update
 
 from app import persistence
+from app.auth import require_principal
+from app.tenancy import ADMIN_TENANT, Principal, set_principal, reset_principal
 
 log = logging.getLogger("nikki.scheduler")
 router = APIRouter()
@@ -32,6 +34,7 @@ def scheduler_sa() -> str | None:
 
 class RunRequest(BaseModel):
     schedule: str = "manual"
+    tenant_id: str | None = None  # manual admin-token runs only; schedules carry their own tenant
     prompt: str | None = None  # defaults to the schedule's stored prompt
     auto_approve: bool | None = None
     wait: bool = False  # manual callers may wait for the result
@@ -59,16 +62,19 @@ def _authorized(authorization: str) -> bool:
     return _verify_oidc(token)
 
 
-async def _execute(run_id: str, schedule: str, prompt: str, auto_approve: bool, thread_id: str) -> None:
+async def _execute(run_id: str, schedule: str, prompt: str, auto_approve: bool, thread_id: str, principal: Principal) -> None:
     from app.headless import run_prompt
 
     r = persistence.scheduled_runs
+    tok = set_principal(principal)
     try:
         out = await asyncio.wait_for(run_prompt(prompt, thread_id, auto_approve=auto_approve), timeout=25 * 60)
         values = {"status": "ok", "output": out[:20000]}
     except Exception as e:  # noqa: BLE001
         log.exception("scheduled run failed")
         values = {"status": "error", "error": f"{type(e).__name__}: {e}"[:4000]}
+    finally:
+        reset_principal(tok)
     async with persistence.engine().begin() as conn:
         await conn.execute(update(r).where(r.c.id == run_id).values(finished_at=datetime.now(timezone.utc), **values))
 
@@ -82,18 +88,21 @@ async def api_run(req: RunRequest, authorization: str = Header(default="")) -> d
     prompt = req.prompt
     async with persistence.engine().connect() as conn:
         row = (await conn.execute(select(s).where(s.c.name == req.schedule))).first()
+    tenant = req.tenant_id or ADMIN_TENANT
     if row is not None:
         prompt = prompt or row._mapping["prompt"]
+        tenant = row._mapping["tenant_id"]
         if req.auto_approve is None:
             auto = row._mapping["auto_approve"] == "true"
     if not prompt:
         raise HTTPException(status_code=400, detail="no prompt (unknown schedule and no prompt given)")
+    principal = Principal(tenant_id=tenant, email=f"scheduler@{tenant}", role="admin" if tenant == ADMIN_TENANT else "owner")
     run_id, now = str(uuid.uuid4()), datetime.now(timezone.utc)
     thread_id = f"sched-{req.schedule}-{now:%Y%m%d-%H%M%S}"
     async with persistence.engine().begin() as conn:
         await conn.execute(persistence.scheduled_runs.insert().values(
-            id=run_id, schedule=req.schedule, thread_id=thread_id, started_at=now, status="running"))
-    task = asyncio.create_task(_execute(run_id, req.schedule, prompt, auto, thread_id))
+            id=run_id, schedule=req.schedule, tenant_id=tenant, thread_id=thread_id, started_at=now, status="running"))
+    task = asyncio.create_task(_execute(run_id, req.schedule, prompt, auto, thread_id, principal))
     if req.wait:
         await task
         async with persistence.engine().connect() as conn:
@@ -103,13 +112,16 @@ async def api_run(req: RunRequest, authorization: str = Header(default="")) -> d
 
 
 @router.get("/api/schedules")
-async def api_schedules(user=Depends(get_current_user)) -> dict:
-    if user is None:
-        raise HTTPException(status_code=401)
+async def api_schedules(p: Principal = Depends(require_principal)) -> dict:
     s, r = persistence.schedules, persistence.scheduled_runs
     async with persistence.engine().connect() as conn:
-        sched = [dict(x._mapping) for x in await conn.execute(select(s).order_by(s.c.created_at))]
-        runs = [dict(x._mapping) for x in await conn.execute(select(r).order_by(r.c.started_at.desc()).limit(100))]
+        sched = [dict(x._mapping) for x in await conn.execute(select(s).where(s.c.tenant_id == p.tenant_id).order_by(s.c.created_at))]
+        runs = [dict(x._mapping) for x in await conn.execute(select(r).where(r.c.tenant_id == p.tenant_id).order_by(r.c.started_at.desc()).limit(100))]
+    labels = {d["name"]: d["label"] or d["name"] for d in sched}
+    for d in sched:
+        d["name"] = d["label"] or d["name"]
+    for d in runs:
+        d["schedule"] = labels.get(d["schedule"], d["schedule"])
     for coll in (sched, runs):
         for d in coll:
             for k, v in list(d.items()):

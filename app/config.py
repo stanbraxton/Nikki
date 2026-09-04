@@ -49,6 +49,14 @@ class Settings:
         "must go through an approval gate; if the user declines, respect it.",
     ))
 
+    tenant_persona: str = field(default_factory=lambda: _env(
+        "NIKKI_TENANT_PERSONA",
+        "You are Nikki, the user's private AI assistant. You are direct, concise, and practical. You reason "
+        "step by step, use tools when they help, and never pretend to have done something you did not do. "
+        "Any action with side effects must go through an approval gate; if the user declines, respect it. "
+        "You only ever see this user's own data; never reference other users.",
+    ))
+
     @property
     def is_postgres(self) -> bool:
         return self.database_url.startswith("postgres")

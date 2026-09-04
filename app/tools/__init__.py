@@ -43,10 +43,18 @@ class ToolRegistry:
     def _load_builtin(self) -> None:
         if self._builtin:
             return
-        from app.tools import db_query, files, google_ws, memory, scheduler, self_maintain, spaces, web
+        from app.tools import custom_api, db_query, files, google_ws, memory, microsoft, scheduler, self_maintain, spaces, web
 
-        for mod in (files, db_query, self_maintain, spaces, web, google_ws, scheduler, memory):
+        for mod in (files, db_query, self_maintain, spaces):  # platform-admin only
+            for t in mod.TOOLS:
+                t.metadata = {**(t.metadata or {}), "admin_only": True}
             self._builtin.extend(mod.TOOLS)
+        for mod in (web, google_ws, microsoft, custom_api, scheduler, memory):
+            self._builtin.extend(mod.TOOLS)
+        for name in google_ws.GMAIL_TOOLS:  # restricted Google scope: admin tenant only until verified
+            for t in google_ws.TOOLS:
+                if t.name == name:
+                    t.metadata = {**(t.metadata or {}), "admin_only": True}
 
     # ---- skills ----------------------------------------------------------
     def _load_skill_file(self, path: Path) -> SkillStatus:
@@ -92,10 +100,18 @@ class ToolRegistry:
                 del self._skills[name]
 
     # ---- public API ------------------------------------------------------
-    def tools(self) -> list[BaseTool]:
+    def tools(self, admin: bool | None = None) -> list[BaseTool]:
+        """Tools visible to the current principal (admin sees everything incl. user skills)."""
+        from app.tenancy import maybe_principal
+
+        if admin is None:
+            p = maybe_principal()
+            admin = bool(p and p.is_admin)
         self._load_builtin()
+        out: dict[str, BaseTool] = {t.name: t for t in self._builtin if admin or not (t.metadata or {}).get("admin_only")}
+        if not admin:
+            return list(out.values())
         self.refresh_skills()
-        out: dict[str, BaseTool] = {t.name: t for t in self._builtin}
         for st in self._skills.values():
             for t in st.tools:
                 if t.name in out:
@@ -105,7 +121,7 @@ class ToolRegistry:
         return list(out.values())
 
     def by_name(self) -> dict[str, BaseTool]:
-        return {t.name: t for t in self.tools()}
+        return {t.name: t for t in self.tools(admin=True)}
 
     def requires_approval(self, tool_name: str) -> bool:
         t = self.by_name().get(tool_name)

@@ -1,3 +1,5 @@
+> **Update (Phase A):** Google is now one provider on the Integrations page (`/integrations`). Client ID/secret can be entered at `/admin` instead of Secret Manager. Customer tenants get Drive + Calendar; Gmail is admin-only until Google verification. See `docs/SAAS.md`.
+
 # Gmail & Google Drive in Nikki
 
 Nikki reads and (with your approval) writes Gmail and Drive through Google's official APIs, using
