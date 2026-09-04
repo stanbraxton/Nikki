@@ -86,6 +86,9 @@ async def authenticate(identifier: str, password: str) -> Principal | None:
                                   .join(t, t.c.id == a.c.tenant_id).where(a.c.email == ident))).first()
         if not row or not check_password(password, row.password_hash):
             return None
+        if row.status == "pending":
+            log.warning("login refused: tenant %s is pending approval", row.tenant_id)
+            return None
         if row.status != "active":
             log.warning("login refused: tenant %s is %s", row.tenant_id, row.status)
             return None
@@ -129,7 +132,7 @@ async def create_tenant(email: str, password: str, name: str) -> Principal:
         tid = base
         while (await conn.execute(select(t.c.id).where(t.c.id == tid))).first():
             tid = f"{base}-{uuid.uuid4().hex[:4]}"
-        await conn.execute(insert(t).values(id=tid, name=name, plan="free", status="active", created_at=_now()))
+        await conn.execute(insert(t).values(id=tid, name=name, plan="free", status="pending", created_at=_now()))
         await conn.execute(insert(a).values(email=email, tenant_id=tid, password_hash=hash_password(password),
                                             role="owner", display_name=name, created_at=_now()))
     log.info("new tenant %s (%s)", tid, email)
@@ -145,16 +148,14 @@ async def signup_page():
 
 @router.post("/signup", response_class=HTMLResponse, include_in_schema=False)
 async def signup_submit(request: Request, email: str = Form(...), password: str = Form(...),
-                        name: str = Form(""), code: str = Form("")):
+                        name: str = Form("")):
     if not signups_enabled():
         raise HTTPException(status_code=403)
-    if signup_code() and code.strip() != signup_code():
-        return HTMLResponse(_signup_form(error="invalid invite code", email=email, name=name), status_code=400)
     try:
         await create_tenant(email, password, name)
     except ValueError as e:
         return HTMLResponse(_signup_form(error=str(e), email=email, name=name), status_code=400)
-    return HTMLResponse(_page("Account created", f"Welcome to Nikki. <a href=\"/login\">Sign in</a> as <b>{email.lower()}</b>."))
+    return HTMLResponse(_page("Account created", f"Your account is pending approval. You'll be notified at <b>{email.lower()}</b> once approved."))
 
 
 @router.get("/api/me")
@@ -175,7 +176,6 @@ def _page(title: str, body: str) -> str:
 
 
 def _signup_form(error: str = "", email: str = "", name: str = "") -> str:
-    code_field = '<label>Invite code<input name="code" required></label>' if signup_code() else ""
     err = f'<div class="err">{error}</div>' if error else ""
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Create account · Nikki</title>{STYLE}</head>
 <body><div class="card"><h1>Create your Nikki account</h1><p class="muted">Your own private assistant with memory, web research, integrations and scheduled tasks.</p>
@@ -183,6 +183,6 @@ def _signup_form(error: str = "", email: str = "", name: str = "") -> str:
 <label>Name or company<input name="name" value="{name}" maxlength="120"></label>
 <label>Email<input name="email" type="email" value="{email}" required></label>
 <label>Password <span class="muted">(10+ characters)</span><input name="password" type="password" minlength="10" required></label>
-{code_field}{err}
+{err}
 <button type="submit">Create account</button></form>
 <p class="muted" style="margin-top:14px">Already have an account? <a href="/login">Sign in</a> · <a href="/terms">Terms</a> · <a href="/privacy">Privacy</a></p></div></body></html>"""

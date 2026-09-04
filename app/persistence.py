@@ -132,7 +132,7 @@ tenants = Table(
     Column("id", String(64), primary_key=True),
     Column("name", String(120), nullable=False),
     Column("plan", String(24), nullable=False, default="free"),
-    Column("status", String(16), nullable=False, default="active"),  # active | suspended
+    Column("status", String(16), nullable=False, default="active"),  # active | pending | suspended
     Column("created_at", DateTime(timezone=True), nullable=False),
 )
 

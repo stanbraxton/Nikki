@@ -188,6 +188,30 @@ async def admin_clear_provider(provider: str, _: Principal = Depends(require_adm
     return {"ok": True}
 
 
+@router.post("/api/admin/tenants/{tenant_id}/approve")
+async def admin_approve_tenant(tenant_id: str, _: Principal = Depends(require_admin)) -> dict:
+    from sqlalchemy import update
+    t = persistence.tenants
+    async with persistence.engine().begin() as conn:
+        result = await conn.execute(update(t).where(t.c.id == tenant_id).values(status="active"))
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="tenant not found")
+    log.info("tenant %s approved", tenant_id)
+    return {"ok": True}
+
+
+@router.post("/api/admin/tenants/{tenant_id}/suspend")
+async def admin_suspend_tenant(tenant_id: str, _: Principal = Depends(require_admin)) -> dict:
+    from sqlalchemy import update
+    t = persistence.tenants
+    async with persistence.engine().begin() as conn:
+        result = await conn.execute(update(t).where(t.c.id == tenant_id).values(status="suspended"))
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="tenant not found")
+    log.info("tenant %s suspended", tenant_id)
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------- pages
 @router.get("/integrations", response_class=HTMLResponse, include_in_schema=False)
 async def integrations_page() -> HTMLResponse:
@@ -265,7 +289,7 @@ ADMIN_HTML = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><met
 <header><h1>🛠 Admin</h1><nav style="margin-left:auto"><a href="/">Chat</a><a href="/integrations">Integrations</a><a href="/schedules">Schedules</a><a href="/spaces">Spaces</a></nav></header>
 <main><h2 style="font-size:16px">Provider registrations</h2><p class="muted">One-time developer app registration per OAuth provider. Once saved here, every tenant can connect with one click. Secrets are stored encrypted.</p>
 <div class="grid" id="prov"></div>
-<h2 style="font-size:16px;margin-top:34px">Tenants</h2><table id="tenants"><thead><tr><th>Tenant</th><th>Name</th><th>Plan</th><th>Status</th><th>Accounts</th><th>Created</th></tr></thead><tbody></tbody></table>
+<h2 style="font-size:16px;margin-top:34px">Tenants</h2><table id="tenants"><thead><tr><th>Tenant</th><th>Name</th><th>Plan</th><th>Status</th><th>Accounts</th><th>Created</th><th>Actions</th></tr></thead><tbody></tbody></table>
 </main><div class="toast" id="toast"></div>
 <script>
 const $=s=>document.querySelector(s);function toast(m){{const t=$('#toast');t.textContent=m;t.style.display='block';setTimeout(()=>t.style.display='none',3500)}}
@@ -277,10 +301,12 @@ async function load(){{const r=await fetch('/api/admin/providers');if(r.status==
    <div class="muted">${{esc(p.hint)}}</div><div class="muted">Redirect URI: <code>${{esc(p.redirect_uri)}}</code></div>
    <form onsubmit="return save(event,'${{p.id}}')"><label>Client ID<input name="client_id" required></label><label>Client secret<input name="client_secret" type="password" required></label>
    <div style="margin-top:10px;display:flex;gap:8px"><button type="submit">Save</button>${{p.configured==='db'?`<button type="button" class="ghost" onclick="clr('${{p.id}}')">Remove</button>`:''}}</div></form>`;g.appendChild(el)}}
- const tb=$('#tenants tbody');tb.innerHTML=d.tenants.map(t=>`<tr><td><code>${{esc(t.id)}}</code></td><td>${{esc(t.name)}}</td><td>${{esc(t.plan)}}</td><td>${{esc(t.status)}}</td><td>${{t.accounts}}</td><td class="muted">${{(t.created_at||'').slice(0,10)}}</td></tr>`).join('');
+ const tb=$('#tenants tbody');tb.innerHTML=d.tenants.map(t=>`<tr><td><code>${{esc(t.id)}}</code></td><td>${{esc(t.name)}}</td><td>${{esc(t.plan)}}</td><td><span class="chip ${{t.status==='active'?'ok':t.status==='pending'?'warn':''}}">${{esc(t.status)}}</span></td><td>${{t.accounts}}</td><td class="muted">${{(t.created_at||'').slice(0,10)}}</td><td>${{t.status==='pending'?`<button class="ghost" onclick="approveTenant('${{t.id}}')">Approve</button>`:t.status==='active'?`<button class="ghost" onclick="suspendTenant('${{t.id}}')">Suspend</button>`:''}}</td></tr>`).join('');
 }}
 async function save(e,pid){{e.preventDefault();const fd=new FormData(e.target);const body={{}};fd.forEach((v,k)=>body[k]=v);
  const r=await fetch('/api/admin/providers/'+pid,{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify(body)}});toast(r.ok?'Saved':'error');load();return false}}
 async function clr(pid){{if(!confirm('Remove stored credentials?'))return;await fetch('/api/admin/providers/'+pid,{{method:'DELETE'}});load()}}
+async function approveTenant(tid){{if(!confirm('Approve this tenant?'))return;const r=await fetch('/api/admin/tenants/'+tid+'/approve',{{method:'POST'}});toast(r.ok?'Approved':'error');load()}}
+async function suspendTenant(tid){{if(!confirm('Suspend this tenant?'))return;const r=await fetch('/api/admin/tenants/'+tid+'/suspend',{{method:'POST'}});toast(r.ok?'Suspended':'error');load()}}
 load();
 </script></body></html>"""
