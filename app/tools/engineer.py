@@ -479,8 +479,21 @@ def _stage_dir(app: dict, bid: str) -> Path:
     subprocess.run(["tar", "-x", "-C", str(stage)], input=ar.stdout, check=True)
     cb, fb = _cloudbuild_yaml(app)
     (stage / "cloudbuild.yaml").write_text(cb)
-    if not (stage / "firebase.json").exists():
-        (stage / "firebase.json").write_text(fb)
+    fbp = stage / "firebase.json"
+    if fbp.exists():
+        # keep the repo's hosting config but always pin the registered site (otherwise
+        # firebase-tools deploys to the project's default site)
+        try:
+            cfg = json.loads(fbp.read_text())
+            hosting = cfg.get("hosting")
+            if isinstance(hosting, dict):
+                hosting["site"] = app["firebase_site"]
+                cfg["hosting"] = hosting
+                fbp.write_text(json.dumps(cfg, indent=2))
+        except (ValueError, OSError):
+            fbp.write_text(fb)
+    else:
+        fbp.write_text(fb)
     (stage / ".gcloudignore").write_text("node_modules\n.git\ndist\n")
     return stage
 
