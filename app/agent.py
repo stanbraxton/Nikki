@@ -56,6 +56,9 @@ def system_prompt() -> str:
         "shares a lasting fact, preference, person or project detail; never store secrets). "
     )
     if admin:
+        from app.tools.knowledge import index_text
+
+        kb_index = index_text() or "empty"
         skills = registry.skill_report()
         loaded = ", ".join(t for s in skills for t in s["tools"]) or "none yet"
         extra = (
@@ -70,6 +73,15 @@ def system_prompt() -> str:
             "Express server.js. Pick a short slug, state the slug and framework before calling the tool, and tell "
             "the user the build takes 3-6 minutes and the link appears in the Spaces Gallery (/spaces). Do not poll "
             "space_status repeatedly in one turn; the UI tracks progress. "
+            "Engineer toolchain: you maintain real software projects hosted on GitHub — repo_open a repo, then "
+            "repo_list/repo_read/repo_search to understand it, repo_edit/repo_write to change it (local, ungated), "
+            "repo_git for status/diff/log, repo_commit_push to publish (gated), deploy_app to build on Cloud Build and "
+            "publish to Firebase Hosting (+ Convex backend) (gated), app_status/build_log to follow a build. Work like "
+            "a careful engineer: read before editing, keep diffs minimal, summarize the diff before pushing, and never "
+            "deploy with uncommitted changes. "
+            f"Knowledge base (curated docs about the owner, his company, this system and every project; read the "
+            f"relevant doc with kb_read before answering questions about them, search with kb_search, record durable "
+            f"learnings with kb_write): {kb_index}. "
         )
     else:
         extra = ""

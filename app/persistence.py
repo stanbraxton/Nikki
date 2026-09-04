@@ -45,6 +45,36 @@ spaces = Table(
     Column("last_error", Text),
 )
 
+apps = Table(  # Engineer: full web apps (git repo -> Cloud Build -> Convex + Firebase Hosting)
+    "apps",
+    metadata,
+    Column("slug", String(40), primary_key=True),
+    Column("title", String(120), nullable=False),
+    Column("repo", String(200), nullable=False),  # owner/name on GitHub
+    Column("branch", String(80), nullable=False, default="main"),
+    Column("build_dir", String(80), nullable=False, default="dist"),
+    Column("convex_secret", String(120)),  # Secret Manager name holding CONVEX_DEPLOY_KEY, or NULL for static apps
+    Column("firebase_site", String(80), nullable=False),
+    Column("custom_domain", String(200)),
+    Column("url", Text),
+    Column("status", String(16), nullable=False, default="registered"),  # registered | building | live | failed
+    Column("last_build_id", String(64)),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
+builds = Table(
+    "builds",
+    metadata,
+    Column("id", String(64), primary_key=True),
+    Column("slug", String(40), index=True, nullable=False),
+    Column("status", String(16), nullable=False),  # queued | running | success | failed
+    Column("log", Text, nullable=False, default=""),
+    Column("url", Text),
+    Column("started_at", DateTime(timezone=True), nullable=False),
+    Column("finished_at", DateTime(timezone=True)),
+)
+
 memories = Table(
     "memories",
     metadata,
