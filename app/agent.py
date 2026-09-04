@@ -10,7 +10,7 @@ import logging
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import create_react_agent
@@ -95,11 +95,56 @@ def system_prompt() -> str:
     )
 
 
+def repair_history(messages: list[Any]) -> list[Any]:
+    """Return a provider-valid copy of the conversation.
+
+    Chat providers reject histories where a tool_result has no matching tool_use in the
+    immediately preceding assistant message, or where a tool_use got no result (this
+    happens after crashes mid-approval, container restarts, or overlapping turns on one
+    thread). The repair is non-destructive: the stored checkpoint is left untouched and
+    only the messages sent to the model are fixed.
+    """
+    out: list[Any] = []
+    open_calls: dict[str, dict] = {}  # tool_call_id -> tool_call awaiting a result
+
+    def close_open() -> None:
+        for tc_id, tc in open_calls.items():
+            out.append(ToolMessage(content="(no result recorded — the call was interrupted)", tool_call_id=tc_id, name=tc.get("name", "tool"), status="error"))
+        open_calls.clear()
+
+    for m in messages:
+        if isinstance(m, ToolMessage):
+            if m.tool_call_id in open_calls:
+                del open_calls[m.tool_call_id]
+                out.append(m)
+            else:
+                log.warning("dropping orphan tool_result %s (%s)", m.tool_call_id, m.name)
+            continue
+        close_open()
+        if isinstance(m, AIMessage):
+            if m.tool_calls:
+                open_calls.update({tc["id"]: tc for tc in m.tool_calls})
+            elif not text_of(m.content).strip() and not getattr(m, "invalid_tool_calls", None):
+                continue  # empty assistant turns are rejected by Anthropic
+        out.append(m)
+    close_open()
+    # Anthropic requires the first message to be a user turn.
+    while out and not isinstance(out[0], HumanMessage):
+        out.pop(0)
+    return out
+
+
+def _pre_model_hook(state: Any) -> dict:
+    msgs = state["messages"] if isinstance(state, dict) else state.messages
+    return {"llm_input_messages": repair_history(list(msgs))}
+
+
 def build_graph(checkpointer: BaseCheckpointSaver, model_spec: str | None = None) -> CompiledStateGraph:
     return create_react_agent(
         make_model(model_spec),
         tools=registry.tools(),
         prompt=system_prompt(),
+        pre_model_hook=_pre_model_hook,
         checkpointer=checkpointer,
         interrupt_before=["tools"],
         interrupt_after=["tools"],  # lets the UI rebuild the graph after a skill hot-load

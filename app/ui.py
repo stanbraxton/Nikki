@@ -233,10 +233,25 @@ async def stream_segment(graph, config: dict, inp: Any, r: TurnRenderer) -> None
 
 
 # ---------------------------------------------------------------- main turn
+_turn_locks: dict[str, asyncio.Lock] = {}
+
+
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
     set_principal(_principal())
     thread_id = cl.context.session.thread_id
+    lock = _turn_locks.setdefault(thread_id, asyncio.Lock())
+    if lock.locked():
+        # Two turns on one thread would interleave checkpoints and corrupt the history.
+        await cl.Message(content="⏳ I'm still working on your previous message — please wait for it to finish (or approve/reject the pending action) and send that again.").send()
+        return
+    async with lock:
+        await _run_turn(message, thread_id)
+    if not lock.locked():
+        _turn_locks.pop(thread_id, None)
+
+
+async def _run_turn(message: cl.Message, thread_id: str) -> None:
     model = cl.user_session.get("model") or settings.model
     await persistence.trace(thread_id, "user", {"text": message.content, "model": model})
     r = TurnRenderer(thread_id)
