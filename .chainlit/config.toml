@@ -24,6 +24,22 @@ sample_rate = 44100
 enabled = true
 max_files = 5
 max_size_mb = 20
+accept = [
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
+    "text/plain",
+    "text/markdown",
+    "text/csv",
+    "application/json",
+    "application/xml",
+    "text/yaml",
+    "text/x-yaml"
+]
 
 [UI]
 name = "Nikki"
