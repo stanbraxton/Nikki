@@ -47,7 +47,7 @@ def _title(path: Path) -> str:
     return path.stem
 
 
-def index_text(max_chars: int = 1400) -> str:
+def index_text(max_chars: int = 4000) -> str:
     """Compact index for the system prompt."""
     rows = [f"{name}: {_title(p)}" for name, p in _docs().items()]
     txt = "; ".join(rows)

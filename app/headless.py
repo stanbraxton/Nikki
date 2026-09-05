@@ -9,7 +9,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage
 
 from app import persistence
-from app.agent import build_graph, pending_tool_calls, rejection_messages, text_of
+from app.agent import build_graph, fallback_model_for, is_billing_error, pending_tool_calls, rejection_messages, text_of
 from app.config import settings
 from app.tools import registry
 
@@ -26,7 +26,18 @@ async def run_prompt(prompt: str, thread_id: str, auto_approve: bool = False, mo
             await graph.aupdate_state(config, {"messages": rejection_messages(stale, "Superseded by a new run.")}, as_node="tools")
         inp: Any = {"messages": [HumanMessage(content=prompt)]}
         for _ in range(settings.recursion_limit):
-            await graph.ainvoke(inp, config)
+            try:
+                await graph.ainvoke(inp, config)
+            except Exception as e:  # noqa: BLE001
+                fb = fallback_model_for(model)
+                if not (fb and is_billing_error(e)):
+                    raise
+                log.warning("billing error on %s; continuing headless run on fallback %s: %r", model or settings.model, fb, e)
+                await persistence.trace(thread_id, "fallback", {"from": model or settings.model, "to": fb, "error": repr(e)})
+                model = fb
+                graph = build_graph(cp, model)
+                state = await graph.aget_state(config)
+                await graph.ainvoke(None if state.next else inp, config)
             state = await graph.aget_state(config)
             if not state.next:
                 break

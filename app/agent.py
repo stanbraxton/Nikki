@@ -35,6 +35,40 @@ def make_model(spec: str | None = None) -> BaseChatModel:
     raise ValueError(f"unknown model provider: {provider!r} (use anthropic:<model> or openai:<model>)")
 
 
+_BILLING_MARKERS = ("credit balance is too low", "insufficient_quota", "billing_hard_limit_reached", "exceeded your current quota")
+
+
+def is_billing_error(e: BaseException) -> bool:
+    """True when a provider refused the call because the account is out of credit."""
+    txt = f"{type(e).__name__}: {e}".lower()
+    return any(m in txt for m in _BILLING_MARKERS)
+
+
+def fallback_model_for(model_spec: str | None) -> str | None:
+    """Fallback spec to use after a billing error on `model_spec`, or None if there is none."""
+    fb = settings.fallback_model
+    cur = model_spec or settings.model
+    if not fb or fb == cur:
+        return None
+    provider = fb.partition(":")[0]
+    if provider == "openai" and not settings.openai_api_key:
+        return None
+    if provider == "anthropic" and not settings.anthropic_api_key:
+        return None
+    return fb
+
+
+def friendly_error(e: BaseException) -> str:
+    """Human-readable message for an unrecoverable turn failure."""
+    if is_billing_error(e):
+        return (
+            "⚠️ I'm temporarily out of API credit for my language model, so I can't answer right now. "
+            "Stan: please top up the provider account (Anthropic → console.anthropic.com → Plans & Billing) — "
+            "no redeploy is needed; I'll work again as soon as the balance is positive."
+        )
+    return f"⚠️ Something went wrong: `{type(e).__name__}: {e}`"
+
+
 def system_prompt() -> str:
     from datetime import datetime, timezone
 

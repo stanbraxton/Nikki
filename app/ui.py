@@ -13,7 +13,7 @@ from chainlit.input_widget import Select
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
 from app import persistence
-from app.agent import build_graph, pending_tool_calls, rejection_messages, text_of
+from app.agent import build_graph, fallback_model_for, friendly_error, is_billing_error, pending_tool_calls, rejection_messages, text_of
 from app.tools.images import IMAGE_MARK
 from app.config import settings
 from app.tenancy import Principal, set_principal
@@ -263,6 +263,32 @@ async def on_message(message: cl.Message) -> None:
         _turn_locks.pop(thread_id, None)
 
 
+async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "TurnRenderer", thread_id: str) -> None:
+    """Run one turn to completion, pausing for approvals on gated tools."""
+    while True:
+        await stream_segment(graph, config, inp, r)
+        await r.close_segment()
+        state = await graph.aget_state(config)
+        if not state.next:
+            break
+        calls = pending_tool_calls(state)
+        gated = [tc for tc in calls if registry.requires_approval(tc["name"])]
+        if gated:
+            approved = await ask_approval(gated)
+            await persistence.trace(thread_id, "approval", {"approved": approved, "tools": [tc["name"] for tc in gated]})
+            if not approved:
+                for tc in calls:
+                    step = r.steps.pop(tc["id"], None)
+                    if step:
+                        step.output = "rejected by user"
+                        step.is_error = True
+                        await step.update()
+                await graph.aupdate_state(config, {"messages": rejection_messages(calls)}, as_node="tools")
+        # resume from the interrupt; rebuild so hot-loaded skills are bound to the model
+        inp = None
+        graph = build_graph(cp, model)
+
+
 async def _run_turn(message: cl.Message, thread_id: str) -> None:
     model = cl.user_session.get("model") or settings.model
     await persistence.trace(thread_id, "user", {"text": message.content, "model": model})
@@ -278,32 +304,26 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
             if stale:
                 await graph.aupdate_state(config, {"messages": rejection_messages(stale, "Superseded by a new user message.")}, as_node="tools")
             inp: Any = {"messages": [HumanMessage(content=message.content)]}
-            while True:
-                await stream_segment(graph, config, inp, r)
+            try:
+                await _drive(graph, cp, model, config, inp, r, thread_id)
+            except Exception as e:  # noqa: BLE001
+                fb = fallback_model_for(model)
+                if not (fb and is_billing_error(e)):
+                    raise
+                log.warning("billing error on %s; retrying turn on fallback %s: %r", model, fb, e)
                 await r.close_segment()
+                await cl.Message(
+                    content=f"⚠️ My primary model's API credit is exhausted (Stan: top up at console.anthropic.com → Plans & Billing). Continuing on the backup model `{fb}` for now."
+                ).send()
+                await persistence.trace(thread_id, "fallback", {"from": model, "to": fb, "error": repr(e)})
+                graph = build_graph(cp, fb)
                 state = await graph.aget_state(config)
-                if not state.next:
-                    break
-                calls = pending_tool_calls(state)
-                gated = [tc for tc in calls if registry.requires_approval(tc["name"])]
-                if gated:
-                    approved = await ask_approval(gated)
-                    await persistence.trace(thread_id, "approval", {"approved": approved, "tools": [tc["name"] for tc in gated]})
-                    if not approved:
-                        for tc in calls:
-                            step = r.steps.pop(tc["id"], None)
-                            if step:
-                                step.output = "rejected by user"
-                                step.is_error = True
-                                await step.update()
-                        await graph.aupdate_state(config, {"messages": rejection_messages(calls)}, as_node="tools")
-                # resume from the interrupt; rebuild so hot-loaded skills are bound to the model
-                inp = None
-                graph = build_graph(cp, model)
+                # If the failed call had already checkpointed the user message, resume; else replay it.
+                await _drive(graph, cp, fb, config, None if state.next else inp, r, thread_id)
     except Exception as e:  # noqa: BLE001
         log.exception("turn failed")
         await r.close_segment()
-        await cl.Message(content=f"⚠️ Something went wrong: `{type(e).__name__}: {e}`").send()
+        await cl.Message(content=friendly_error(e)).send()
         await persistence.trace(thread_id, "error", {"error": repr(e)})
         return
 
