@@ -308,6 +308,50 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
     r = TurnRenderer(thread_id)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.recursion_limit}
 
+    # Handle image attachments: automatically describe them with vision
+    user_content = message.content
+    if message.elements:
+        images = [el for el in message.elements if el.mime and "image" in el.mime]
+        if images:
+            import base64
+            from pathlib import Path
+            
+            image_descriptions = []
+            for img in images:
+                try:
+                    img_path = Path(img.path)
+                    img_data = img_path.read_bytes()
+                    b64 = base64.b64encode(img_data).decode('utf-8')
+                    
+                    suffix = img_path.suffix.lower()
+                    mime_map = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', 
+                                '.gif': 'image/gif', '.webp': 'image/webp'}
+                    mime = mime_map.get(suffix, img.mime or 'image/png')
+                    
+                    # Use OpenAI vision to describe the image
+                    if settings.openai_api_key:
+                        from openai import OpenAI
+                        client = OpenAI(api_key=settings.openai_api_key)
+                        response = client.chat.completions.create(
+                            model="gpt-4o",
+                            messages=[{
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "Describe this image in detail."},
+                                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+                                ]
+                            }],
+                            max_tokens=1000
+                        )
+                        desc = response.choices[0].message.content or "(no description)"
+                        image_descriptions.append(f"[Image: {img.name}]\n{desc}")
+                except Exception as e:
+                    log.exception("failed to process image %s", img.name)
+                    image_descriptions.append(f"[Image: {img.name}] (failed to process: {e})")
+            
+            if image_descriptions:
+                user_content = f"{user_content}\n\n" + "\n\n".join(image_descriptions) if user_content else "\n\n".join(image_descriptions)
+
     try:
         async with persistence.checkpointer() as cp:
             graph = build_graph(cp, model)
@@ -316,7 +360,7 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
             stale = pending_tool_calls(await graph.aget_state(config))
             if stale:
                 await graph.aupdate_state(config, {"messages": rejection_messages(stale, "Superseded by a new user message.")}, as_node="tools")
-            inp: Any = {"messages": [HumanMessage(content=message.content)]}
+            inp: Any = {"messages": [HumanMessage(content=user_content)]}
             try:
                 await _drive(graph, cp, model, config, inp, r, thread_id)
             except Exception as e:  # noqa: BLE001
