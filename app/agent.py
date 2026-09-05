@@ -98,6 +98,18 @@ def friendly_error(e: BaseException) -> str:
 
 
 def system_prompt() -> str:
+    """Full system prompt as one string (stable part + volatile part)."""
+    stable, volatile = system_prompt_parts()
+    return f"{stable}\n\n{volatile}"
+
+
+def system_prompt_parts() -> tuple[str, str]:
+    """(stable, volatile) halves of the system prompt.
+
+    The stable half (persona, capabilities, KB index, rules) is identical from turn to turn and is
+    marked for Anthropic prompt caching; the volatile half (who, clock, memory digest) follows it so
+    changes there never invalidate the cached prefix.
+    """
     from datetime import datetime, timezone
 
     from app.tenancy import maybe_principal
@@ -154,14 +166,29 @@ def system_prompt() -> str:
     else:
         extra = ""
     persona = settings.persona if admin else settings.tenant_persona
-    return (
-        f"{persona}\n\n{who}\n"
-        f"Current date/time: {datetime.now(timezone.utc):%A %Y-%m-%d %H:%M} UTC.\n\n"
-        f"{memory_block}{common}{extra}"
+    stable = (
+        f"{persona}\n\n{common}{extra}"
         "Tools marked as requiring approval will pause for the user's confirmation; explain briefly "
         "what you are about to do before calling them. Answer in plain, well-structured Markdown. "
         "Whenever you encounter an error (a failed tool call, an API refusal, missing access), never just report "
         "the raw error: state the problem in plain words, list the possible solutions, and give your recommendation."
+    )
+    volatile = f"{who}\nCurrent date/time: {datetime.now(timezone.utc):%A %Y-%m-%d %H:%M} UTC.\n\n{memory_block}".strip()
+    return stable, volatile
+
+
+def system_message(model_spec: str | None = None) -> Any:
+    """System prompt for the given model: cached content blocks on Anthropic, plain text elsewhere."""
+    stable, volatile = system_prompt_parts()
+    if (model_spec or settings.model).partition(":")[0] != "anthropic":
+        return f"{stable}\n\n{volatile}"
+    from langchain_core.messages import SystemMessage
+
+    return SystemMessage(
+        content=[
+            {"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": volatile},
+        ]
     )
 
 
@@ -235,17 +262,63 @@ def trim_history(messages: list[Any], budget_tokens: int | None = None) -> list[
     return messages[cut:]
 
 
+def compact_old_tool_results(messages: list[Any], max_chars: int | None = None) -> list[Any]:
+    """Shorten bulky tool results from *earlier* turns (everything before the latest HumanMessage).
+
+    A full kb_read / http_fetch / repo_read result is needed while the model works on it, but once the
+    turn is over it would otherwise be re-sent in full on every later message of the thread. The
+    stored checkpoint is untouched; only the messages sent to the model are compacted.
+    """
+    limit = max_chars or settings.old_tool_result_chars
+    if limit <= 0:
+        return messages
+    last_human = max((i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=-1)
+    out: list[Any] = []
+    for i, m in enumerate(messages):
+        if i < last_human and isinstance(m, ToolMessage) and isinstance(m.content, str) and len(m.content) > limit:
+            m = m.model_copy(update={"content": m.content[:limit] + f"\n[... {len(m.content) - limit:,} more chars omitted from history; call the tool again if you need them]"})
+        out.append(m)
+    return out
+
+
+def mark_cache_breakpoint(messages: list[Any]) -> list[Any]:
+    """Put an Anthropic cache breakpoint on the last message so the whole conversation prefix is cached
+    for the next turn (5-minute TTL). Non-destructive copy."""
+    if not messages:
+        return messages
+    last = messages[-1]
+    content = last.content
+    if isinstance(content, str):
+        blocks = [{"type": "text", "text": content or " ", "cache_control": {"type": "ephemeral"}}]
+    elif isinstance(content, list) and content and isinstance(content[-1], dict) and content[-1].get("type") in ("text", "tool_result", "image"):
+        blocks = [*content[:-1], {**content[-1], "cache_control": {"type": "ephemeral"}}]
+    else:
+        return messages
+    return [*messages[:-1], last.model_copy(update={"content": blocks})]
+
+
+def _prepare_messages(msgs: list[Any], anthropic: bool) -> list[Any]:
+    out = compact_old_tool_results(trim_history(repair_history(list(msgs))))
+    return mark_cache_breakpoint(out) if anthropic else out
+
+
 def _pre_model_hook(state: Any) -> dict:
     msgs = state["messages"] if isinstance(state, dict) else state.messages
-    return {"llm_input_messages": trim_history(repair_history(list(msgs)))}
+    return {"llm_input_messages": _prepare_messages(msgs, settings.model.startswith("anthropic:"))}
 
 
 def build_graph(checkpointer: BaseCheckpointSaver, model_spec: str | None = None) -> CompiledStateGraph:
+    anthropic = (model_spec or settings.model).startswith("anthropic:")
+
+    def pre_model_hook(state: Any) -> dict:
+        msgs = state["messages"] if isinstance(state, dict) else state.messages
+        return {"llm_input_messages": _prepare_messages(msgs, anthropic)}
+
     return create_react_agent(
         make_model(model_spec),
         tools=registry.tools(),
-        prompt=system_prompt(),
-        pre_model_hook=_pre_model_hook,
+        prompt=system_message(model_spec),
+        pre_model_hook=pre_model_hook,
         checkpointer=checkpointer,
         interrupt_before=["tools"],
         interrupt_after=["tools"],  # lets the UI rebuild the graph after a skill hot-load

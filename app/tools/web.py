@@ -14,7 +14,7 @@ import httpx
 from bs4 import BeautifulSoup
 from langchain_core.tools import tool
 
-MAX_CHARS = 12000
+MAX_CHARS = 6000
 UA = "Mozilla/5.0 (compatible; Nikki/1.0; +https://nikkiaia.com)"
 
 

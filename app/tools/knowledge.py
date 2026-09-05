@@ -17,6 +17,7 @@ from app.config import ROOT
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,80}$")
 MAX_READ = 60_000
+DEFAULT_READ = 8_000
 
 
 def base_dir() -> Path:
@@ -62,13 +63,19 @@ def kb_list() -> str:
 
 
 @tool
-def kb_read(name: str) -> str:
-    """Read one knowledge-base document by name (as listed by kb_list)."""
+def kb_read(name: str, max_chars: int = DEFAULT_READ, offset: int = 0) -> str:
+    """Read one knowledge-base document by name (as listed by kb_list). Returns up to max_chars starting at
+    offset; prefer kb_search for a specific fact and only raise max_chars / page with offset when you really
+    need the whole document."""
     p = _docs().get(name.strip().removesuffix(".md"))
     if not p:
         return f"not found: {name}. Use kb_list."
     t = p.read_text(encoding="utf-8", errors="replace")
-    return t[:MAX_READ] + (f"\n[... truncated {len(t) - MAX_READ} chars]" if len(t) > MAX_READ else "")
+    limit = max(500, min(int(max_chars), MAX_READ))
+    start = max(0, int(offset))
+    chunk = t[start : start + limit]
+    rest = len(t) - (start + len(chunk))
+    return chunk + (f"\n[... {rest:,} more chars; call kb_read again with offset={start + len(chunk)}]" if rest > 0 else "")
 
 
 @tool
