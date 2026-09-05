@@ -11,6 +11,15 @@ latex = false
 auto_tag_thread = true
 edit_message = true
 
+[features.audio]
+enabled = true
+min_decibels = -45
+initial_silence_timeout = 3000
+silence_timeout = 1500
+max_duration = 15000
+chunk_duration = 1000
+sample_rate = 44100
+
 [features.spontaneous_file_upload]
 enabled = true
 max_files = 5
