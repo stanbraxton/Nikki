@@ -14,6 +14,7 @@ from app.integrations.routes import router as integrations_router
 from app.legal import router as legal_router
 from app.scheduler import router as scheduler_router
 from app.spaces_gallery import router as spaces_router
+from app.voice import router as voice_router
 from app.config import ROOT, settings
 from app.tools import registry
 
@@ -68,5 +69,6 @@ app.include_router(auth_router)
 app.include_router(integrations_router)
 app.include_router(scheduler_router)
 app.include_router(legal_router)
+app.include_router(voice_router)
 
 mount_chainlit(app=app, target=str(ROOT / "app" / "ui.py"), path="/")

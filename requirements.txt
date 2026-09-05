@@ -5,6 +5,7 @@ langgraph>=0.6
 langchain-core
 langchain-anthropic
 langchain-openai
+openai>=1.0
 langgraph-checkpoint-postgres
 langgraph-checkpoint-sqlite
 psycopg[binary,pool]

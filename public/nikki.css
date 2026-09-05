@@ -1,2 +1,33 @@
-:root { --primary: #7c5cff; }
-#header .watermark, a[href*="chainlit"] { display: none !important; }
+/* Nikki voice controls styling */
+
+#nikki-voice-controls button:hover {
+  transform: scale(1.05);
+  border-color: #6366f1 !important;
+}
+
+#nikki-voice-controls button:active {
+  transform: scale(0.95);
+}
+
+.nikki-speaker-btn:hover {
+  background: #3d3d50 !important;
+  border-color: #6366f1 !important;
+}
+
+.nikki-speaker-btn:active {
+  transform: scale(0.95);
+}
+
+/* Recording pulse animation */
+@keyframes pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.7);
+  }
+  50% {
+    box-shadow: 0 0 0 10px rgba(220, 38, 38, 0);
+  }
+}
+
+#nikki-mic-button.recording {
+  animation: pulse 1.5s infinite;
+}
