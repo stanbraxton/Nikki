@@ -58,15 +58,43 @@ def fallback_model_for(model_spec: str | None) -> str | None:
     return fb
 
 
+_TOO_LARGE_MARKERS = ("request too large", "tokens per min", "context_length_exceeded", "prompt is too long", "maximum context length")
+
+
+def is_too_large_error(e: BaseException) -> bool:
+    """True when the provider rejected the call because the request exceeded a token/TPM limit."""
+    txt = f"{type(e).__name__}: {e}".lower()
+    return any(m in txt for m in _TOO_LARGE_MARKERS)
+
+
 def friendly_error(e: BaseException) -> str:
-    """Human-readable message for an unrecoverable turn failure."""
+    """Human-readable message for an unrecoverable turn failure: problem / solutions / recommendation."""
     if is_billing_error(e):
         return (
-            "⚠️ I'm temporarily out of API credit for my language model, so I can't answer right now. "
-            "Stan: please top up the provider account (Anthropic → console.anthropic.com → Plans & Billing) — "
-            "no redeploy is needed; I'll work again as soon as the balance is positive."
+            "⚠️ **Problem:** my language-model provider refused the request — the API account is out of credit.\n\n"
+            "**Possible solutions:**\n"
+            "1. Top up the Anthropic account (console.anthropic.com → Plans & Billing) and enable auto-reload.\n"
+            "2. Pick a different model from the chat settings for this thread.\n\n"
+            "**Recommendation:** option 1 — no redeploy is needed; I work again as soon as the balance is positive."
         )
-    return f"⚠️ Something went wrong: `{type(e).__name__}: {e}`"
+    if is_too_large_error(e):
+        return (
+            "⚠️ **Problem:** this conversation has grown larger than the model's per-request token limit, "
+            "so the provider rejected the call.\n\n"
+            "**Possible solutions:**\n"
+            "1. Start a new chat thread (I keep long-term memory and the knowledge base, so context is not lost).\n"
+            "2. Pick a model with a higher token limit from the chat settings.\n"
+            "3. Raise the provider's rate limits (OpenAI: platform.openai.com/account/rate-limits).\n\n"
+            "**Recommendation:** option 1 — fastest and free."
+        )
+    return (
+        f"⚠️ **Problem:** the request failed with `{type(e).__name__}: {str(e)[:600]}`.\n\n"
+        "**Possible solutions:**\n"
+        "1. Send the message again (transient provider errors are common).\n"
+        "2. Start a new thread if the error repeats.\n"
+        "3. Ask Stan to check the service logs if it persists.\n\n"
+        "**Recommendation:** option 1 first, then 2."
+    )
 
 
 def system_prompt() -> str:
@@ -131,7 +159,9 @@ def system_prompt() -> str:
         f"Current date/time: {datetime.now(timezone.utc):%A %Y-%m-%d %H:%M} UTC.\n\n"
         f"{memory_block}{common}{extra}"
         "Tools marked as requiring approval will pause for the user's confirmation; explain briefly "
-        "what you are about to do before calling them. Answer in plain, well-structured Markdown."
+        "what you are about to do before calling them. Answer in plain, well-structured Markdown. "
+        "Whenever you encounter an error (a failed tool call, an API refusal, missing access), never just report "
+        "the raw error: state the problem in plain words, list the possible solutions, and give your recommendation."
     )
 
 
@@ -174,9 +204,40 @@ def repair_history(messages: list[Any]) -> list[Any]:
     return out
 
 
+def _approx_tokens(m: Any) -> int:
+    """Cheap token estimate (~4 chars/token) covering text content and tool-call arguments."""
+    n = len(text_of(m.content))
+    if isinstance(m, AIMessage) and m.tool_calls:
+        n += sum(len(str(tc.get("args", ""))) + 40 for tc in m.tool_calls)
+    return n // 4 + 8
+
+
+def trim_history(messages: list[Any], budget_tokens: int | None = None) -> list[Any]:
+    """Drop the oldest turns until the history fits the token budget.
+
+    Always keeps the most recent user turn and everything after it. Cuts only at a
+    HumanMessage boundary so tool_use/tool_result pairs are never split. The stored
+    checkpoint is untouched; only the messages sent to the model are trimmed.
+    """
+    budget = budget_tokens or settings.history_budget_tokens
+    total = sum(_approx_tokens(m) for m in messages)
+    if total <= budget:
+        return messages
+    human_idx = [i for i, m in enumerate(messages) if isinstance(m, HumanMessage)]
+    cut = 0
+    for i in human_idx[1:]:
+        if total <= budget:
+            break
+        total -= sum(_approx_tokens(m) for m in messages[cut:i])
+        cut = i
+    if cut:
+        log.info("trimmed history: dropped %d messages, ~%d tokens remain", cut, total)
+    return messages[cut:]
+
+
 def _pre_model_hook(state: Any) -> dict:
     msgs = state["messages"] if isinstance(state, dict) else state.messages
-    return {"llm_input_messages": repair_history(list(msgs))}
+    return {"llm_input_messages": trim_history(repair_history(list(msgs)))}
 
 
 def build_graph(checkpointer: BaseCheckpointSaver, model_spec: str | None = None) -> CompiledStateGraph:

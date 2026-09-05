@@ -27,7 +27,9 @@ class Settings:
     openai_api_key: str | None = _env("OPENAI_API_KEY")
     # Used automatically when the primary provider rejects a call for billing reasons
     # (e.g. Anthropic "credit balance is too low"). Empty string disables the fallback.
-    fallback_model: str | None = _env("NIKKI_FALLBACK_MODEL", "openai:gpt-4.1")
+    fallback_model: str | None = _env("NIKKI_FALLBACK_MODEL", "openai:gpt-4.1-mini")
+    # Approx. token budget for conversation history sent to the model (system prompt excluded).
+    history_budget_tokens: int = int(_env("NIKKI_HISTORY_BUDGET_TOKENS", "24000"))
     max_tokens: int = int(_env("NIKKI_MAX_TOKENS", "4096"))
     recursion_limit: int = int(_env("NIKKI_RECURSION_LIMIT", "40"))
     # Persistence. Postgres in prod (postgresql://user:pw@/db?host=/cloudsql/...),
