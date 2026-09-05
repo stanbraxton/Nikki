@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Column, DateTime, MetaData, String, Table, Text, inspect, insert, text
+from sqlalchemy import Column, DateTime, Integer, MetaData, String, Table, Text, inspect, insert, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from app.config import ROOT, settings
@@ -173,6 +173,19 @@ provider_credentials = Table(  # developer app registrations, set by the platfor
     Column("updated_at", DateTime(timezone=True), nullable=False),
 )
 
+token_usage = Table(  # track LLM token consumption per conversation turn
+    "token_usage",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column("tenant_id", String(64), index=True, nullable=False, server_default="admin"),
+    Column("thread_id", String(64), index=True, nullable=False),
+    Column("ts", DateTime(timezone=True), nullable=False),
+    Column("model", String(60), nullable=False),  # provider:model (e.g. anthropic:claude-sonnet-4-5)
+    Column("input_tokens", Integer, nullable=False, default=0),
+    Column("output_tokens", Integer, nullable=False, default=0),
+    Column("total_tokens", Integer, nullable=False, default=0),
+)
+
 _engine: AsyncEngine | None = None
 _sync_engine = None
 
@@ -254,6 +267,28 @@ async def trace(thread_id: str, kind: str, payload: Any) -> None:
             )
     except Exception:  # noqa: BLE001 — tracing must never break a turn
         log.exception("trace write failed")
+
+
+async def log_token_usage(thread_id: str, model: str, input_tokens: int, output_tokens: int) -> None:
+    """Record token usage for a conversation turn."""
+    import uuid
+
+    try:
+        async with engine().begin() as conn:
+            await conn.execute(
+                insert(token_usage).values(
+                    id=str(uuid.uuid4()),
+                    thread_id=thread_id,
+                    tenant_id=(_tenant_or_admin()),
+                    ts=datetime.now(timezone.utc),
+                    model=model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    total_tokens=input_tokens + output_tokens,
+                )
+            )
+    except Exception:  # noqa: BLE001 — token tracking must never break a turn
+        log.exception("token usage logging failed")
 
 
 @asynccontextmanager

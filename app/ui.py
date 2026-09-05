@@ -158,6 +158,8 @@ class TurnRenderer:
         self.reasoning: cl.Step | None = None
         self.steps: dict[str, cl.Step] = {}
         self.final_text: list[str] = []
+        self.input_tokens: int = 0
+        self.output_tokens: int = 0
 
     async def token(self, text: str) -> None:
         if self.msg is None:
@@ -223,6 +225,11 @@ async def stream_segment(graph, config: dict, inp: Any, r: TurnRenderer) -> None
             msg, meta = chunk
             if meta.get("langgraph_node") != "agent" or not isinstance(msg, AIMessageChunk):
                 continue
+            # Capture token usage from message metadata
+            if hasattr(msg, "usage_metadata") and msg.usage_metadata:
+                usage = msg.usage_metadata
+                r.input_tokens = usage.get("input_tokens", 0)
+                r.output_tokens = usage.get("output_tokens", 0)
             content = msg.content
             if isinstance(content, list):
                 for block in content:
@@ -236,10 +243,16 @@ async def stream_segment(graph, config: dict, inp: Any, r: TurnRenderer) -> None
                 if not isinstance(update, dict):
                     continue
                 for m in update.get("messages", []):
-                    if node == "agent" and isinstance(m, AIMessage) and m.tool_calls:
-                        await r.close_segment()
-                        for tc in m.tool_calls:
-                            await r.tool_planned(tc)
+                    if node == "agent" and isinstance(m, AIMessage):
+                        # Capture usage from complete AIMessage too
+                        if hasattr(m, "usage_metadata") and m.usage_metadata:
+                            usage = m.usage_metadata
+                            r.input_tokens = usage.get("input_tokens", 0)
+                            r.output_tokens = usage.get("output_tokens", 0)
+                        if m.tool_calls:
+                            await r.close_segment()
+                            for tc in m.tool_calls:
+                                await r.tool_planned(tc)
                     elif node == "tools" and isinstance(m, ToolMessage):
                         await r.tool_result(m)
 
@@ -328,3 +341,7 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
         return
 
     await persistence.trace(thread_id, "assistant", {"text": "\n\n".join(r.final_text)[:8000]})
+    
+    # Log token usage for this turn
+    if r.input_tokens > 0 or r.output_tokens > 0:
+        await persistence.log_token_usage(thread_id, model, r.input_tokens, r.output_tokens)
