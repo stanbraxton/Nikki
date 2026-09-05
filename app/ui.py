@@ -308,27 +308,27 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
     r = TurnRenderer(thread_id)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.recursion_limit}
 
-    # Handle image attachments: automatically describe them with vision
+    # Handle file attachments: images (vision), PDFs, DOCX, TXT
     user_content = message.content
     if message.elements:
-        images = [el for el in message.elements if el.mime and "image" in el.mime]
-        if images:
-            import base64
-            from pathlib import Path
-            
-            image_descriptions = []
-            for img in images:
-                try:
-                    img_path = Path(img.path)
-                    img_data = img_path.read_bytes()
+        import base64
+        from pathlib import Path
+        
+        file_contents = []
+        
+        for el in message.elements:
+            try:
+                el_path = Path(el.path)
+                suffix = el_path.suffix.lower()
+                
+                # Images: use vision
+                if el.mime and "image" in el.mime:
+                    img_data = el_path.read_bytes()
                     b64 = base64.b64encode(img_data).decode('utf-8')
-                    
-                    suffix = img_path.suffix.lower()
                     mime_map = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', 
                                 '.gif': 'image/gif', '.webp': 'image/webp'}
-                    mime = mime_map.get(suffix, img.mime or 'image/png')
+                    mime = mime_map.get(suffix, el.mime or 'image/png')
                     
-                    # Use OpenAI vision to describe the image
                     if settings.openai_api_key:
                         from openai import OpenAI
                         client = OpenAI(api_key=settings.openai_api_key)
@@ -344,13 +344,55 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
                             max_tokens=1000
                         )
                         desc = response.choices[0].message.content or "(no description)"
-                        image_descriptions.append(f"[Image: {img.name}]\n{desc}")
-                except Exception as e:
-                    log.exception("failed to process image %s", img.name)
-                    image_descriptions.append(f"[Image: {img.name}] (failed to process: {e})")
-            
-            if image_descriptions:
-                user_content = f"{user_content}\n\n" + "\n\n".join(image_descriptions) if user_content else "\n\n".join(image_descriptions)
+                        file_contents.append(f"[Image: {el.name}]\n{desc}")
+                
+                # PDFs: extract text
+                elif suffix == '.pdf':
+                    try:
+                        import pypdf
+                        reader = pypdf.PdfReader(el_path)
+                        text_parts = []
+                        for i, page in enumerate(reader.pages[:100], 1):  # limit to 100 pages
+                            page_text = page.extract_text()
+                            if page_text:
+                                text_parts.append(f"--- Page {i} ---\n{page_text}")
+                        extracted = "\n\n".join(text_parts)
+                        if extracted:
+                            file_contents.append(f"[PDF: {el.name}]\n{extracted[:50000]}")  # limit to 50k chars
+                        else:
+                            file_contents.append(f"[PDF: {el.name}] (no text extracted)")
+                    except ImportError:
+                        file_contents.append(f"[PDF: {el.name}] (pypdf not available; install with: pip install pypdf)")
+                
+                # DOCX: extract text
+                elif suffix in ('.docx', '.doc'):
+                    try:
+                        import docx
+                        doc = docx.Document(el_path)
+                        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+                        extracted = "\n\n".join(paragraphs)
+                        if extracted:
+                            file_contents.append(f"[DOCX: {el.name}]\n{extracted[:50000]}")
+                        else:
+                            file_contents.append(f"[DOCX: {el.name}] (no text extracted)")
+                    except ImportError:
+                        file_contents.append(f"[DOCX: {el.name}] (python-docx not available; install with: pip install python-docx)")
+                
+                # Plain text files
+                elif suffix in ('.txt', '.md', '.csv', '.json', '.xml', '.yaml', '.yml'):
+                    text = el_path.read_text(encoding='utf-8', errors='ignore')
+                    file_contents.append(f"[{suffix.upper().lstrip('.')}: {el.name}]\n{text[:50000]}")
+                
+                else:
+                    # Unsupported file type
+                    file_contents.append(f"[File: {el.name}] (unsupported format: {suffix})")
+                    
+            except Exception as e:
+                log.exception("failed to process file %s", el.name)
+                file_contents.append(f"[File: {el.name}] (failed to process: {e})")
+        
+        if file_contents:
+            user_content = f"{user_content}\n\n" + "\n\n".join(file_contents) if user_content else "\n\n".join(file_contents)
 
     try:
         async with persistence.checkpointer() as cp:
