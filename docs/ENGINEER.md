@@ -24,6 +24,7 @@ with an optional Convex backend. This is how Stan's web apps are maintained afte
 | `github_create_repo name` | approval | new private repo under the token owner |
 | `register_app slug title repo [convex_deploy_key] [firebase_site]` | approval | register a deployable app |
 | `deploy_app slug` | approval | Cloud Build: bun install → convex deploy + build → firebase deploy |
+| `deploy_self` | approval | Cloud Build: docker build → Artifact Registry → new revision of the `nikki` Cloud Run service (repo `cloudbuild.yaml`) |
 | `app_status`, `build_log`, `list_apps` | — | follow builds |
 | `add_custom_domain slug domain` | approval | attach a domain; returns DNS records to create |
 | `delete_app slug` | approval | unregister (repo + Convex untouched) |

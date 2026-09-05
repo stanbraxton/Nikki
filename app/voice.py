@@ -13,8 +13,15 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/voice", tags=["voice"])
 
-# Initialize OpenAI client (uses OPENAI_API_KEY from environment)
-client = AsyncOpenAI()
+_client: AsyncOpenAI | None = None
+
+
+def client() -> AsyncOpenAI:
+    """Lazy OpenAI client (uses OPENAI_API_KEY) so importing the app never fails without a key."""
+    global _client
+    if _client is None:
+        _client = AsyncOpenAI()
+    return _client
 
 
 @router.post("/transcribe")
@@ -34,7 +41,7 @@ async def transcribe(
         audio_file.name = audio.filename or "audio.webm"
         
         # Call OpenAI Whisper API
-        transcript = await client.audio.transcriptions.create(
+        transcript = await client().audio.transcriptions.create(
             model="whisper-1",
             file=audio_file,
             response_format="text"
@@ -60,7 +67,7 @@ async def speak(
     """
     try:
         # Call OpenAI TTS API
-        response = await client.audio.speech.create(
+        response = await client().audio.speech.create(
             model="tts-1",  # or "tts-1-hd" for higher quality
             voice=voice,
             input=text,

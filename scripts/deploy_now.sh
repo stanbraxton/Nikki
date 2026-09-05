@@ -1,57 +1,14 @@
-#!/bin/bash
-# Immediate deployment script - triggers Cloud Build manually
-# Use this to deploy the current committed code without setting up automated triggers
-
-set -e
-
-PROJECT=${PROJECT:-nikkiaia-prod}
-REGION=${REGION:-us-east4}
-
-echo "Deploying Nikki to Cloud Run..."
-echo "Project: $PROJECT"
-echo "Region: $REGION"
-echo ""
-
-# Ensure we're using the correct project
-gcloud config set project "$PROJECT"
-
-# Enable required APIs if not already enabled
-gcloud services enable cloudbuild.googleapis.com --quiet
-gcloud services enable run.googleapis.com --quiet
-gcloud services enable containerregistry.googleapis.com --quiet
-
-# Get the Cloud Build service account and grant permissions
-PROJECT_NUMBER=$(gcloud projects describe "$PROJECT" --format="value(projectNumber)")
-CLOUD_BUILD_SA="${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com"
-
-echo "Granting permissions to Cloud Build service account..."
-gcloud projects add-iam-policy-binding "$PROJECT" \
-  --member="serviceAccount:$CLOUD_BUILD_SA" \
-  --role="roles/run.admin" \
-  --condition=None \
-  --quiet 2>/dev/null || true
-
-gcloud projects add-iam-policy-binding "$PROJECT" \
-  --member="serviceAccount:$CLOUD_BUILD_SA" \
-  --role="roles/iam.serviceAccountUser" \
-  --condition=None \
-  --quiet 2>/dev/null || true
-
-# Submit the build
-echo ""
-echo "Submitting build to Cloud Build..."
-echo "(This will take 3-5 minutes)"
-echo ""
-
-gcloud builds submit \
-  --config=cloudbuild.yaml \
-  --region="$REGION" \
-  --substitutions="_REGION=$REGION" \
-  .
-
-echo ""
-echo "✅ Deployment complete!"
-echo ""
-echo "Your Nikki instance should now be running with voice capabilities."
-echo "Visit: https://nikkiaia.com"
-echo ""
+#!/usr/bin/env bash
+# Manual deploy of the committed HEAD via Cloud Build (same path as Nikki's `deploy_self` tool).
+# Usage: PROJECT=nikkiaia-prod REGION=us-east4 bash scripts/deploy_now.sh
+set -euo pipefail
+PROJECT=${PROJECT:-nikkiaia-prod}; REGION=${REGION:-us-east4}
+TAG="$(git rev-parse --short HEAD)-$(date +%Y%m%d-%H%M%S)"
+STAGE=$(mktemp -d)
+git archive --format=tar HEAD | tar -x -C "$STAGE"
+cp cloudbuild.yaml "$STAGE/cloudbuild.yaml"
+echo "== Cloud Build: tag $TAG"
+gcloud builds submit "$STAGE" --config "$STAGE/cloudbuild.yaml" --project "$PROJECT" --region "$REGION" \
+  --substitutions "_REGION=$REGION,_TAG=$TAG" -q
+rm -rf "$STAGE"
+echo "deploy done: $(gcloud run services describe nikki --region "$REGION" --project "$PROJECT" --format='value(status.latestReadyRevisionName)')"

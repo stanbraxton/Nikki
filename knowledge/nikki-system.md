@@ -26,6 +26,7 @@ Nikki is Stan Braxton's standalone private AI assistant and engineer, running on
   PROJECT=nikkiaia-prod REGION=us-east4 DOMAIN=nikkiaia.com bash scripts/deploy.sh
   ```
   *(Note: `deploy.sh` builds the working tree, not HEAD. Always check `git status` and stash or commit stray files before deploying.)*
+- **Self-deploy (you can ship your own changes)**: after `repo_commit_push` on `stanbraxton/Nikki`, call `deploy_self` (gated — Stan approves in chat). It snapshots the pushed HEAD, runs `cloudbuild.yaml` on Cloud Build (docker build → Artifact Registry → `gcloud run deploy nikki --image …`, which keeps the service's secrets/env/volumes) and rolls a new revision in ~5 minutes. Follow with `build_log(<id>)`; the build id starts with `nikki-`. Expect a brief blip when the new revision takes traffic. `scripts/deploy_now.sh` is the same path for a human with gcloud. Refuse to deploy with uncommitted or unpushed changes.
 
 ## Gotchas & Troubleshooting
 

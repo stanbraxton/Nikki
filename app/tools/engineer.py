@@ -588,11 +588,14 @@ def _reconcile_build(b: dict | None) -> dict | None:
     if not final:
         return b
     app = _app(b["slug"])
-    if final == "success" and app:
-        url = f"https://{app['custom_domain']}" if app.get("custom_domain") else f"https://{app['firebase_site']}.web.app"
+    if final == "success":
+        if app:
+            url = f"https://{app['custom_domain']}" if app.get("custom_domain") else f"https://{app['firebase_site']}.web.app"
+            _set_app(b["slug"], status="live", url=url)
+        else:  # self-deploy: the old instance (and its build thread) is replaced by the new revision
+            url = _cfg("PUBLIC_URL", "")
         _append_build_log(b["id"], f"Cloud Build {cb_id}: SUCCESS (reconciled)")
         _set_build(b["id"], status="success", finished_at=_now(), url=url)
-        _set_app(b["slug"], status="live", url=url)
     else:
         try:
             errs = _cloud_build_errors(cb_id)
@@ -716,10 +719,95 @@ def delete_app(slug: str, delete_hosting_site: bool = False) -> str:
         return f"error: {e}"
 
 
+
+# ------------------------------------------------------------------ self deploy (Nikki's own Cloud Run service)
+SELF_REPO = "stanbraxton/Nikki"
+
+
+def self_service() -> str:
+    return _cfg("SELF_SERVICE", "nikki")  # type: ignore[return-value]
+
+
+def _run_self_build(bid: str, path: Path, tag: str) -> None:
+    stage = Path("/tmp/builds") / bid
+    try:
+        stage.mkdir(parents=True, exist_ok=True)
+        ar = subprocess.run(["git", "archive", "--format=tar", "HEAD"], cwd=path, capture_output=True, check=True)
+        subprocess.run(["tar", "-x", "-C", str(stage)], input=ar.stdout, check=True)
+        if not (stage / "cloudbuild.yaml").exists():
+            raise RuntimeError("cloudbuild.yaml missing in repo HEAD")
+        _set_build(bid, status="running")
+        cmd = [gcloud_bin(), "builds", "submit", str(stage), "--config", str(stage / "cloudbuild.yaml"),
+               "--project", project(), "--region", region(),
+               "--substitutions", f"_REGION={region()},_SERVICE={self_service()},_TAG={tag}",
+               "--gcs-source-staging-dir", f"gs://run-sources-{project()}-{region()}/engineer", "-q"]
+        _append_build_log(bid, f"$ gcloud builds submit ... (Cloud Build, tag {tag})")
+        proc = subprocess.Popen(cmd, cwd=stage, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                env={**os.environ, "CLOUDSDK_CORE_DISABLE_PROMPTS": "1"})
+        assert proc.stdout
+        for line in proc.stdout:
+            if line.strip():
+                _append_build_log(bid, line)
+        rc = proc.wait(timeout=1800)
+        if rc != 0:
+            cb_id = _cloud_build_id(_build_row(bid) or {})
+            if cb_id:
+                try:
+                    _append_build_log(bid, "--- Cloud Build errors ---\n" + _cloud_build_errors(cb_id))
+                except (subprocess.SubprocessError, OSError):
+                    pass
+            _set_build(bid, status="failed", finished_at=_now())
+            return
+        rev = subprocess.run([gcloud_bin(), "run", "services", "describe", self_service(), "--region", region(),
+                              "--project", project() or "", "--format", "value(status.latestReadyRevisionName)"],
+                             capture_output=True, text=True, timeout=120).stdout.strip()
+        _append_build_log(bid, f"live revision: {rev}")
+        _set_build(bid, status="success", finished_at=_now(), url=_cfg("PUBLIC_URL", ""))
+    except Exception as e:  # noqa: BLE001
+        log.exception("self build %s failed", bid)
+        _append_build_log(bid, f"error: {e}")
+        _set_build(bid, status="failed", finished_at=_now())
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+@tool
+def deploy_self() -> str:
+    """Redeploy Nikki herself: snapshot the committed HEAD of stanbraxton/Nikki (must be pushed and clean), build the
+    container on Cloud Build and roll a new revision of the nikki Cloud Run service (settings/secrets are kept).
+    Requires approval. Returns a build id immediately; the rollout takes 4-8 minutes — follow it with build_log,
+    don't poll in a loop. The running conversation may drop for a few seconds when the new revision takes traffic."""
+    try:
+        path = _ensure_clone(SELF_REPO, "main")
+        _git(path, "fetch", "origin", check=False)
+        if _git(path, "status", "--porcelain", check=False):
+            return "error: working tree has uncommitted changes — repo_commit_push (or discard them) first"
+        _git(path, "pull", "--ff-only", check=False)
+        if _git(path, "log", "--oneline", "origin/main..HEAD", check=False):
+            return "error: local commits are not pushed — repo_commit_push first so GitHub matches what gets deployed"
+        sha = _git(path, "rev-parse", "--short", "HEAD")
+        with persistence.sync_engine().connect() as c:
+            running = [dict(r._mapping) for r in c.execute(
+                select(persistence.builds).where(persistence.builds.c.slug == "nikki",
+                                                 persistence.builds.c.status.in_(("queued", "running"))))]
+        for b in running:
+            b = _reconcile_build(b)
+            if b and b["status"] in ("queued", "running"):
+                return f"a self-deploy is already running ({b['id']}) — build_log('{b['id']}')"
+        bid = f"nikki-{uuid.uuid4().hex[:8]}"
+        tag = f"{sha}-{_now():%Y%m%d-%H%M%S}"
+        with persistence.sync_engine().begin() as c:
+            c.execute(insert(persistence.builds).values(id=bid, slug="nikki", status="queued", log="", started_at=_now()))
+        threading.Thread(target=_run_self_build, args=(bid, path, tag), name=f"build-{bid}", daemon=True).start()
+        return f"self-deploy {bid} queued (HEAD {sha}, image tag {tag}). Check build_log('{bid}') in ~5 minutes."
+    except Exception as e:  # noqa: BLE001
+        return f"error: {e}"
+
+
 TOOLS = [repo_open, repo_list, repo_read, repo_search, repo_write, repo_edit, repo_git,
          repo_commit_push, github_create_repo, repo_run,
-         register_app, deploy_app, app_status, build_log, list_apps, add_custom_domain, delete_app]
+         register_app, deploy_app, deploy_self, app_status, build_log, list_apps, add_custom_domain, delete_app]
 for _t in (repo_open, repo_list, repo_read, repo_search, repo_write, repo_edit, repo_git, app_status, build_log, list_apps):
     _t.metadata = {"requires_approval": False}
-for _t in (repo_commit_push, github_create_repo, repo_run, register_app, deploy_app, add_custom_domain, delete_app):
+for _t in (repo_commit_push, github_create_repo, repo_run, register_app, deploy_app, deploy_self, add_custom_domain, delete_app):
     _t.metadata = {"requires_approval": True}
