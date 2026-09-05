@@ -237,6 +237,86 @@ def drive_create_doc(title: str, content: str, account: str = "", folder_id: str
         return f"error: {type(e).__name__}: {e}"
 
 
+@tool
+def drive_find_folder(path: str, account: str = "") -> str:
+    """Resolve a Drive folder by path like 'Church/sermons' (case-insensitive, searched from My Drive root
+    and shared drives) and return its id + link, listing its contents. Use the id with drive_upload/drive_create_doc."""
+    try:
+        email = _resolve(account)
+        svc = _svc(email, "drive", "v3")
+        parts = [x for x in path.replace("\\", "/").split("/") if x.strip()]
+        if not parts:
+            return "error: empty path"
+        FOLDER = "application/vnd.google-apps.folder"
+
+        def _find(name: str, parent: str | None) -> list[dict]:
+            safe = name.replace("'", "\\'")
+            q = f"name = '{safe}' and mimeType = '{FOLDER}' and trashed = false"
+            if parent:
+                q += f" and '{parent}' in parents"
+            res = svc.files().list(q=q, fields="files(id,name,parents,webViewLink)", pageSize=25,
+                                   supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+            return res.get("files", [])
+
+        candidates = _find(parts[0], None)
+        for name in parts[1:]:
+            nxt: list[dict] = []
+            for c in candidates:
+                nxt += _find(name, c["id"])
+            candidates = nxt
+        if not candidates:
+            return f"[{email}] no folder matches {'/'.join(parts)!r}"
+        f = candidates[0]
+        kids = svc.files().list(q=f"'{f['id']}' in parents and trashed = false", pageSize=30, orderBy="modifiedTime desc",
+                                fields="files(id,name,mimeType,modifiedTime)", supportsAllDrives=True,
+                                includeItemsFromAllDrives=True).execute().get("files", [])
+        lines = [f"[{email}] folder '{'/'.join(parts)}' id={f['id']} {f.get('webViewLink', '')}"]
+        if len(candidates) > 1:
+            lines.append(f"(note: {len(candidates)} folders matched; using the first — others: "
+                         + ", ".join(c["id"] for c in candidates[1:]) + ")")
+        lines += [f"- id={k['id']} | {k['name']} | {k['mimeType'].split('/')[-1].replace('vnd.google-apps.', '')} | "
+                  f"{k.get('modifiedTime', '')[:10]}" for k in kids] or ["(empty)"]
+        return "\n".join(lines)
+    except Exception as e:  # noqa: BLE001
+        return f"error: {type(e).__name__}: {e}"
+
+
+@tool
+def drive_upload(path: str, folder_id: str = "", name: str = "", account: str = "", convert_to_google: bool = False) -> str:
+    """Upload a file from Nikki's workspace (e.g. a .docx/.pdf/.xlsx) to Google Drive, optionally into folder_id
+    (get it via drive_find_folder). convert_to_google=True turns Office files into Google Docs/Sheets/Slides.
+    Requires approval."""
+    try:
+        import mimetypes
+
+        from googleapiclient.http import MediaFileUpload
+
+        from app.tools.files import _resolve as _ws
+
+        local = _ws(path)
+        if not local.is_file():
+            return f"error: {path} is not a file in the workspace"
+        email = _resolve(account)
+        svc = _svc(email, "drive", "v3")
+        mime = mimetypes.guess_type(local.name)[0] or "application/octet-stream"
+        meta: dict[str, Any] = {"name": name or local.name}
+        if folder_id:
+            meta["parents"] = [folder_id]
+        if convert_to_google:
+            conv = {"application/vnd.openxmlformats-officedocument.wordprocessingml.document": "application/vnd.google-apps.document",
+                    "application/msword": "application/vnd.google-apps.document",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "application/vnd.google-apps.spreadsheet",
+                    "text/csv": "application/vnd.google-apps.spreadsheet",
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "application/vnd.google-apps.presentation"}
+            if mime in conv:
+                meta["mimeType"] = conv[mime]
+        media = MediaFileUpload(str(local), mimetype=mime, resumable=local.stat().st_size > 5_000_000)
+        f = svc.files().create(body=meta, media_body=media, fields="id,name,webViewLink", supportsAllDrives=True).execute()
+        return f"uploaded '{f['name']}' to Drive ({email}): {f.get('webViewLink')} (id={f['id']})"
+    except Exception as e:  # noqa: BLE001
+        return f"error: {type(e).__name__}: {e}"
+
+
 
 @tool
 def gcal_list_events(days: int = 7, account: str = "", calendar_id: str = "primary", query: str = "") -> str:
@@ -278,10 +358,10 @@ def gcal_create_event(title: str, start: str, end: str, account: str = "", descr
     return f"created event '{title}' {start} → {end} ({email}): {ev.get('htmlLink', '')}"
 
 
-for _t in (google_accounts, gmail_search, gmail_read, drive_search, drive_read, gcal_list_events):
+for _t in (google_accounts, gmail_search, gmail_read, drive_search, drive_read, drive_find_folder, gcal_list_events):
     _t.metadata = {"requires_approval": False}
-for _t in (gmail_send, drive_create_doc, gcal_create_event):
+for _t in (gmail_send, drive_create_doc, drive_upload, gcal_create_event):
     _t.metadata = {"requires_approval": True}
 
-TOOLS = [google_accounts, gmail_search, gmail_read, gmail_send, drive_search, drive_read, drive_create_doc, gcal_list_events, gcal_create_event]
+TOOLS = [google_accounts, gmail_search, gmail_read, gmail_send, drive_search, drive_read, drive_find_folder, drive_upload, drive_create_doc, gcal_list_events, gcal_create_event]
 GMAIL_TOOLS = {"gmail_search", "gmail_read", "gmail_send"}

@@ -42,6 +42,8 @@ Google account. Repeat for each account you want Nikki to see (personal, Green C
 | `gmail_send` | **yes** | "Reply and tell them Thursday works." |
 | `drive_search` | no | "Find the Q3 lease spreadsheet in Drive." |
 | `drive_read` | no | "Summarize that doc." (Docs, Sheets, PDFs, text) |
+| `drive_find_folder` | no | "Find my Church/sermons folder." (resolves a folder path to an id) |
+| `drive_upload` | **yes** | "Put that .docx in Church/sermons." (uploads a workspace file into a folder) |
 | `drive_create_doc` | **yes** | "Save this summary as a Google Doc." |
 
 With several accounts connected, say which one ("check my Green Collar inbox"); otherwise Nikki
