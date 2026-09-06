@@ -21,7 +21,7 @@ steps:
     name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
     entrypoint: gcloud
     args: ['run', 'deploy', '${_SERVICE}', '--region', '${_REGION}', '--project', '$PROJECT_ID',
-           '--image', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:${_TAG}', '--quiet']
+           '--image', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:${_TAG}', '--memory', '2Gi', '--quiet']
 
 images:
   - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:${_TAG}'

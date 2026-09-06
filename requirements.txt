@@ -24,3 +24,8 @@ google-auth-httplib2
 pypdf
 python-docx
 cryptography>=42
+openpyxl
+python-pptx
+fpdf2
+pillow
+playwright

@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 ENV CLOUDSDK_CORE_DISABLE_PROMPTS=1
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
+RUN playwright install --with-deps chromium && rm -rf /var/lib/apt/lists/*
 COPY app ./app
 COPY .chainlit ./.chainlit
 COPY public ./public

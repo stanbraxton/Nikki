@@ -14,9 +14,11 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Too
 
 from app import persistence
 from app.agent import build_graph, fallback_model_for, friendly_error, is_billing_error, pending_tool_calls, rejection_messages, text_of
+from app.tools.artifacts import FILE_MARK, marks_in
 from app.tools.images import IMAGE_MARK
 from app.config import settings
 from app.tenancy import Principal, set_principal
+from app.uploads import ingest_uploads
 from app.tools import registry
 
 log = logging.getLogger("nikki.ui")
@@ -212,6 +214,8 @@ class TurnRenderer:
         await step.update()
         if tm.name == "generate_image" and out.startswith(IMAGE_MARK):
             await self.show_image(out)
+        elif FILE_MARK in out:
+            await attach_files(marks_in(out))
         if tm.name == "deploy_space" and out.startswith("queued deploy of Space"):
             m = re.search(r"Space '([a-z0-9-]+)'", out)
             if m:
@@ -302,97 +306,35 @@ async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "Tu
         graph = build_graph(cp, model)
 
 
+async def attach_files(rels: list[str]) -> None:
+    """Attach workspace files a tool produced: images inline, audio with a player, others as downloads."""
+    elements = []
+    for rel in rels:
+        path = (settings.workspace_dir / rel).resolve()
+        if not path.is_file() or settings.workspace_dir.resolve() not in path.parents:
+            continue
+        ext = path.suffix.lower()
+        if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+            elements.append(cl.Image(name=path.name, path=str(path), display="inline", size="large"))
+        elif ext in (".mp3", ".wav", ".m4a", ".ogg", ".webm"):
+            elements.append(cl.Audio(name=path.name, path=str(path), display="inline"))
+        else:
+            elements.append(cl.File(name=path.name, path=str(path), display="inline"))
+    if elements:
+        await cl.Message(content="", elements=elements).send()
+
+
 async def _run_turn(message: cl.Message, thread_id: str) -> None:
     model = cl.user_session.get("model") or settings.model
     await persistence.trace(thread_id, "user", {"text": message.content, "model": model})
     r = TurnRenderer(thread_id)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.recursion_limit}
 
-    # Handle file attachments: images (vision), PDFs, DOCX, TXT
+    # Handle file attachments: save each one into the workspace (uploads/) so tools can act on it,
+    # and inline a text rendering (PDF/DOCX/XLSX/PPTX/CSV text, image transcription, audio transcript).
     user_content = message.content
     if message.elements:
-        import base64
-        from pathlib import Path
-        
-        file_contents = []
-        
-        for el in message.elements:
-            try:
-                el_path = Path(el.path)
-                suffix = el_path.suffix.lower()
-                
-                # Images: use vision
-                if el.mime and "image" in el.mime:
-                    img_data = el_path.read_bytes()
-                    b64 = base64.b64encode(img_data).decode('utf-8')
-                    mime_map = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', 
-                                '.gif': 'image/gif', '.webp': 'image/webp'}
-                    mime = mime_map.get(suffix, el.mime or 'image/png')
-                    
-                    if settings.openai_api_key:
-                        from openai import OpenAI
-                        client = OpenAI(api_key=settings.openai_api_key)
-                        response = client.chat.completions.create(
-                            model="gpt-4o",
-                            messages=[{
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": "Describe this image in detail."},
-                                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
-                                ]
-                            }],
-                            max_tokens=1000
-                        )
-                        desc = response.choices[0].message.content or "(no description)"
-                        file_contents.append(f"[Image: {el.name}]\n{desc}")
-                
-                # PDFs: extract text
-                elif suffix == '.pdf':
-                    try:
-                        import pypdf
-                        reader = pypdf.PdfReader(el_path)
-                        text_parts = []
-                        for i, page in enumerate(reader.pages[:100], 1):  # limit to 100 pages
-                            page_text = page.extract_text()
-                            if page_text:
-                                text_parts.append(f"--- Page {i} ---\n{page_text}")
-                        extracted = "\n\n".join(text_parts)
-                        if extracted:
-                            file_contents.append(f"[PDF: {el.name}]\n{extracted[:50000]}")  # limit to 50k chars
-                        else:
-                            file_contents.append(f"[PDF: {el.name}] (no text extracted)")
-                    except ImportError:
-                        file_contents.append(f"[PDF: {el.name}] (pypdf not available; install with: pip install pypdf)")
-                
-                # DOCX: extract text
-                elif suffix in ('.docx', '.doc'):
-                    try:
-                        import docx
-                        doc = docx.Document(el_path)
-                        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-                        extracted = "\n\n".join(paragraphs)
-                        if extracted:
-                            file_contents.append(f"[DOCX: {el.name}]\n{extracted[:50000]}")
-                        else:
-                            file_contents.append(f"[DOCX: {el.name}] (no text extracted)")
-                    except ImportError:
-                        file_contents.append(f"[DOCX: {el.name}] (python-docx not available; install with: pip install python-docx)")
-                
-                # Plain text files
-                elif suffix in ('.txt', '.md', '.csv', '.json', '.xml', '.yaml', '.yml'):
-                    text = el_path.read_text(encoding='utf-8', errors='ignore')
-                    file_contents.append(f"[{suffix.upper().lstrip('.')}: {el.name}]\n{text[:50000]}")
-                
-                else:
-                    # Unsupported file type
-                    file_contents.append(f"[File: {el.name}] (unsupported format: {suffix})")
-                    
-            except Exception as e:
-                log.exception("failed to process file %s", el.name)
-                file_contents.append(f"[File: {el.name}] (failed to process: {e})")
-        
-        if file_contents:
-            user_content = f"{user_content}\n\n" + "\n\n".join(file_contents) if user_content else "\n\n".join(file_contents)
+        user_content = await asyncio.to_thread(ingest_uploads, message.content, message.elements)
 
     try:
         async with persistence.checkpointer() as cp:

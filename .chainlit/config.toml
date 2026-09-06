@@ -23,7 +23,7 @@ sample_rate = 44100
 [features.spontaneous_file_upload]
 enabled = true
 max_files = 5
-max_size_mb = 20
+max_size_mb = 25
 accept = [
     "image/png",
     "image/jpeg",
@@ -38,7 +38,18 @@ accept = [
     "application/json",
     "application/xml",
     "text/yaml",
-    "text/x-yaml"
+    "text/x-yaml",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "audio/mpeg",
+    "audio/mp4",
+    "audio/x-m4a",
+    "audio/wav",
+    "audio/webm",
+    "audio/ogg",
+    "video/mp4",
+    "video/webm"
 ]
 
 [UI]
