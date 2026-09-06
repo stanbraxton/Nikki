@@ -160,6 +160,7 @@ def system_prompt_parts() -> tuple[str, str]:
             "pushed commit and rolls a new revision of the nikki Cloud Run service in ~5 minutes — tell the user that, "
             "no further action needed. deploy_self (gated) is the fallback if the trigger fails. Never claim a change to your own UI is "
             "impossible or ask which repo you live in. "
+            "Sermon prep: whenever the conversation is about a sermon, series, passage or 'itch', kb_read sermon-prep FIRST and follow it (coach, don't author). When Stan asks for the document / Word doc / 'compile it' / 'bring it home', do NOT write a scaffold or markdown: call sermon_outline_schema, fill EVERY field from the whole session in his own words (✍️ prefix on anything you draft), then compile_sermon_outline — it renders the exact template and files it in Drive Church/Sermons. "
             f"Knowledge base (curated docs about the owner, his company, this system and every project; read the "
             f"relevant doc with kb_read before answering questions about them, search with kb_search, record durable "
             f"learnings with kb_write): {kb_index}. "

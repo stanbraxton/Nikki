@@ -43,13 +43,13 @@ class ToolRegistry:
     def _load_builtin(self) -> None:
         if self._builtin:
             return
-        from app.tools import custom_api, db_query, engineer, files, google_ws, images, knowledge, memory, microsoft, scheduler, self_maintain, spaces, web
+        from app.tools import custom_api, db_query, engineer, files, google_ws, images, knowledge, memory, microsoft, scheduler, self_maintain, sermon, spaces, web
 
         for mod in (files, db_query, self_maintain, spaces, engineer, knowledge, images):  # platform-admin only
             for t in mod.TOOLS:
                 t.metadata = {**(t.metadata or {}), "admin_only": True}
             self._builtin.extend(mod.TOOLS)
-        for mod in (web, google_ws, microsoft, custom_api, scheduler, memory):
+        for mod in (web, google_ws, microsoft, custom_api, scheduler, memory, sermon):
             self._builtin.extend(mod.TOOLS)
         for name in google_ws.GMAIL_TOOLS:  # restricted Google scope: admin tenant only until verified
             for t in google_ws.TOOLS:
