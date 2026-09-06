@@ -55,38 +55,47 @@
     if (location.pathname.startsWith('/login') || location.pathname.startsWith('/signup')) return;
     if (document.getElementById('nikki-voice-controls')) return;
 
-    // Find the chat input container
-    var inputContainer = document.querySelector('#chat-input');
-    if (!inputContainer) return;
-
-    // Find the input textarea
-    var textarea = inputContainer.querySelector('textarea');
-    if (!textarea) return;
+    // Find the input actions container (where the attachment/settings buttons are)
+    var actionsContainer = document.querySelector('form[class*="ChatInput"] div[class*="inputActions"]');
+    if (!actionsContainer) {
+      // Fallback: try to find any form with chat input
+      actionsContainer = document.querySelector('form button[type="submit"]');
+      if (actionsContainer) actionsContainer = actionsContainer.parentElement;
+    }
+    if (!actionsContainer) return;
 
     // Create voice controls container
     var voiceContainer = document.createElement('div');
     voiceContainer.id = 'nikki-voice-controls';
-    voiceContainer.style.cssText = 'display:flex;align-items:center;gap:8px;position:absolute;right:60px;bottom:12px;z-index:10';
+    voiceContainer.style.cssText = 'display:inline-flex;align-items:center;gap:4px;margin-right:4px';
 
     // Microphone button
     var micButton = document.createElement('button');
     micButton.id = 'nikki-mic-button';
+    micButton.type = 'button';
     micButton.innerHTML = '🎤';
     micButton.title = 'Record voice message';
-    micButton.style.cssText = 'background:#2d2d40;border:2px solid #444;border-radius:50%;width:36px;height:36px;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;transition:all 0.2s';
+    micButton.style.cssText = 'background:transparent;border:none;cursor:pointer;font-size:20px;padding:6px;display:flex;align-items:center;justify-content:center;transition:all 0.2s;opacity:0.7';
     
+    micButton.addEventListener('mouseenter', function() { this.style.opacity = '1'; });
+    micButton.addEventListener('mouseleave', function() { 
+      if (!isRecording) this.style.opacity = '0.7'; 
+    });
     micButton.addEventListener('click', toggleRecording);
     
     // Speaker button (toggle auto-play)
     var speakerButton = document.createElement('button');
     speakerButton.id = 'nikki-speaker-button';
+    speakerButton.type = 'button';
     speakerButton.innerHTML = '🔊';
     speakerButton.title = 'Voice responses: ON';
-    speakerButton.style.cssText = 'background:#2d2d40;border:2px solid #444;border-radius:50%;width:36px;height:36px;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;transition:all 0.2s';
+    speakerButton.style.cssText = 'background:transparent;border:none;cursor:pointer;font-size:20px;padding:6px;display:flex;align-items:center;justify-content:center;transition:all 0.2s;opacity:0.7';
     
     var voiceEnabled = localStorage.getItem('nikki-voice-enabled') !== 'false';
     updateSpeakerButton(speakerButton, voiceEnabled);
     
+    speakerButton.addEventListener('mouseenter', function() { this.style.opacity = '1'; });
+    speakerButton.addEventListener('mouseleave', function() { this.style.opacity = '0.7'; });
     speakerButton.addEventListener('click', function() {
       voiceEnabled = !voiceEnabled;
       localStorage.setItem('nikki-voice-enabled', voiceEnabled);
@@ -95,7 +104,9 @@
 
     voiceContainer.appendChild(micButton);
     voiceContainer.appendChild(speakerButton);
-    inputContainer.appendChild(voiceContainer);
+    
+    // Insert before the first button in the actions container
+    actionsContainer.insertBefore(voiceContainer, actionsContainer.firstChild);
 
     // Listen for new messages to auto-play
     observeMessages();
@@ -104,7 +115,7 @@
   function updateSpeakerButton(button, enabled) {
     button.innerHTML = enabled ? '🔊' : '🔇';
     button.title = 'Voice responses: ' + (enabled ? 'ON' : 'OFF');
-    button.style.borderColor = enabled ? '#6366f1' : '#444';
+    button.style.opacity = enabled ? '1' : '0.5';
   }
 
   async function toggleRecording() {
@@ -117,8 +128,7 @@
       }
       isRecording = false;
       micButton.innerHTML = '🎤';
-      micButton.style.background = '#2d2d40';
-      micButton.style.borderColor = '#444';
+      micButton.style.opacity = '0.7';
     } else {
       // Start recording
       try {
@@ -142,8 +152,7 @@
         mediaRecorder.start();
         isRecording = true;
         micButton.innerHTML = '⏹️';
-        micButton.style.background = '#dc2626';
-        micButton.style.borderColor = '#ef4444';
+        micButton.style.opacity = '1';
         
       } catch (err) {
         console.error('Microphone access denied:', err);
