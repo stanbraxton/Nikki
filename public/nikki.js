@@ -55,31 +55,54 @@
     if (location.pathname.startsWith('/login') || location.pathname.startsWith('/signup')) return;
     if (document.getElementById('nikki-voice-controls')) return;
 
-    // Find the input actions container (where the attachment/settings buttons are)
-    var actionsContainer = document.querySelector('form[class*="ChatInput"] div[class*="inputActions"]');
-    if (!actionsContainer) {
-      // Fallback: try to find any form with chat input
-      actionsContainer = document.querySelector('form button[type="submit"]');
-      if (actionsContainer) actionsContainer = actionsContainer.parentElement;
+    // Try multiple strategies to find the right place to insert controls
+    var actionsContainer = null;
+    
+    // Strategy 1: Look for the header right section (where theme/settings are)
+    var header = document.getElementById('header');
+    if (header) {
+      var headerRight = header.querySelector(':scope > div.flex.items-center.gap-1');
+      if (headerRight) actionsContainer = headerRight;
     }
+    
+    // Strategy 2: Look for chat input area
+    if (!actionsContainer) {
+      var chatInput = document.querySelector('#chat-input');
+      if (chatInput) {
+        // Find parent form
+        var form = chatInput.closest('form');
+        if (form) {
+          // Look for action buttons container
+          var buttons = form.querySelector('div[class*="flex"]');
+          if (buttons) actionsContainer = buttons;
+        }
+      }
+    }
+    
     if (!actionsContainer) return;
 
     // Create voice controls container
     var voiceContainer = document.createElement('div');
     voiceContainer.id = 'nikki-voice-controls';
-    voiceContainer.style.cssText = 'display:inline-flex;align-items:center;gap:4px;margin-right:4px';
+    voiceContainer.style.cssText = 'display:inline-flex;align-items:center;gap:6px;margin-right:8px';
 
     // Microphone button
     var micButton = document.createElement('button');
     micButton.id = 'nikki-mic-button';
     micButton.type = 'button';
     micButton.innerHTML = '🎤';
-    micButton.title = 'Record voice message';
-    micButton.style.cssText = 'background:transparent;border:none;cursor:pointer;font-size:20px;padding:6px;display:flex;align-items:center;justify-content:center;transition:all 0.2s;opacity:0.7';
+    micButton.title = 'Click to record voice message';
+    micButton.style.cssText = 'background:#2d2d40;border:1px solid #444;border-radius:6px;cursor:pointer;font-size:18px;padding:8px 12px;display:flex;align-items:center;justify-content:center;transition:all 0.2s;opacity:0.85;min-width:44px;height:36px';
     
-    micButton.addEventListener('mouseenter', function() { this.style.opacity = '1'; });
+    micButton.addEventListener('mouseenter', function() { 
+      this.style.opacity = '1'; 
+      this.style.background = '#3d3d50';
+    });
     micButton.addEventListener('mouseleave', function() { 
-      if (!isRecording) this.style.opacity = '0.7'; 
+      if (!isRecording) {
+        this.style.opacity = '0.85'; 
+        this.style.background = '#2d2d40';
+      }
     });
     micButton.addEventListener('click', toggleRecording);
     
@@ -88,14 +111,20 @@
     speakerButton.id = 'nikki-speaker-button';
     speakerButton.type = 'button';
     speakerButton.innerHTML = '🔊';
-    speakerButton.title = 'Voice responses: ON';
-    speakerButton.style.cssText = 'background:transparent;border:none;cursor:pointer;font-size:20px;padding:6px;display:flex;align-items:center;justify-content:center;transition:all 0.2s;opacity:0.7';
+    speakerButton.title = 'Voice responses: ON (click to toggle)';
+    speakerButton.style.cssText = 'background:#2d2d40;border:1px solid #444;border-radius:6px;cursor:pointer;font-size:18px;padding:8px 12px;display:flex;align-items:center;justify-content:center;transition:all 0.2s;opacity:0.85;min-width:44px;height:36px';
     
     var voiceEnabled = localStorage.getItem('nikki-voice-enabled') !== 'false';
     updateSpeakerButton(speakerButton, voiceEnabled);
     
-    speakerButton.addEventListener('mouseenter', function() { this.style.opacity = '1'; });
-    speakerButton.addEventListener('mouseleave', function() { this.style.opacity = '0.7'; });
+    speakerButton.addEventListener('mouseenter', function() { 
+      this.style.opacity = '1'; 
+      this.style.background = '#3d3d50';
+    });
+    speakerButton.addEventListener('mouseleave', function() { 
+      this.style.opacity = '0.85'; 
+      this.style.background = '#2d2d40';
+    });
     speakerButton.addEventListener('click', function() {
       voiceEnabled = !voiceEnabled;
       localStorage.setItem('nikki-voice-enabled', voiceEnabled);
@@ -105,7 +134,7 @@
     voiceContainer.appendChild(micButton);
     voiceContainer.appendChild(speakerButton);
     
-    // Insert before the first button in the actions container
+    // Insert at the beginning of the container
     actionsContainer.insertBefore(voiceContainer, actionsContainer.firstChild);
 
     // Listen for new messages to auto-play
@@ -114,8 +143,14 @@
 
   function updateSpeakerButton(button, enabled) {
     button.innerHTML = enabled ? '🔊' : '🔇';
-    button.title = 'Voice responses: ' + (enabled ? 'ON' : 'OFF');
-    button.style.opacity = enabled ? '1' : '0.5';
+    button.title = 'Voice responses: ' + (enabled ? 'ON' : 'OFF') + ' (click to toggle)';
+    if (enabled) {
+      button.style.opacity = '0.85';
+      button.style.borderColor = '#4a9eff';
+    } else {
+      button.style.opacity = '0.5';
+      button.style.borderColor = '#444';
+    }
   }
 
   async function toggleRecording() {
@@ -128,7 +163,10 @@
       }
       isRecording = false;
       micButton.innerHTML = '🎤';
-      micButton.style.opacity = '0.7';
+      micButton.style.opacity = '0.85';
+      micButton.style.background = '#2d2d40';
+      micButton.style.borderColor = '#444';
+      micButton.title = 'Click to record voice message';
     } else {
       // Start recording
       try {
@@ -153,10 +191,13 @@
         isRecording = true;
         micButton.innerHTML = '⏹️';
         micButton.style.opacity = '1';
+        micButton.style.background = '#ff4444';
+        micButton.style.borderColor = '#ff6666';
+        micButton.title = 'Recording... Click to stop';
         
       } catch (err) {
         console.error('Microphone access denied:', err);
-        alert('Microphone access denied. Please allow microphone access to use voice input.');
+        alert('⚠️ Microphone access denied.\n\nPlease allow microphone access in your browser settings to use voice input.');
       }
     }
   }
@@ -216,9 +257,21 @@
         
         var speakerBtn = document.createElement('button');
         speakerBtn.className = 'nikki-speaker-btn';
-        speakerBtn.innerHTML = '▶️';
-        speakerBtn.title = 'Play audio';
-        speakerBtn.style.cssText = 'background:#2d2d40;border:1px solid #444;border-radius:4px;padding:4px 8px;cursor:pointer;font-size:14px;margin-top:8px;transition:all 0.2s';
+        speakerBtn.innerHTML = '🔊 Play';
+        speakerBtn.title = 'Listen to this message';
+        speakerBtn.style.cssText = 'background:#2d2d40;border:1px solid #4a9eff;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px;margin-top:10px;transition:all 0.2s;color:#c9bdff;font-weight:500;display:inline-flex;align-items:center;gap:4px';
+        
+        speakerBtn.addEventListener('mouseenter', function() {
+          this.style.background = '#3d3d50';
+          this.style.borderColor = '#5aafff';
+        });
+        
+        speakerBtn.addEventListener('mouseleave', function() {
+          if (!this.disabled) {
+            this.style.background = '#2d2d40';
+            this.style.borderColor = '#4a9eff';
+          }
+        });
         
         speakerBtn.addEventListener('click', async function() {
           var text = contentDiv.textContent || contentDiv.innerText;
@@ -245,8 +298,10 @@
     if (cleanText.length === 0) return;
     
     var originalContent = button.innerHTML;
-    button.innerHTML = '⏸️';
+    button.innerHTML = '⏸️ Playing...';
     button.disabled = true;
+    button.style.opacity = '0.6';
+    button.style.cursor = 'wait';
     
     try {
       var formData = new FormData();
@@ -269,12 +324,16 @@
       audio.onended = function() {
         button.innerHTML = originalContent;
         button.disabled = false;
+        button.style.opacity = '1';
+        button.style.cursor = 'pointer';
         URL.revokeObjectURL(audioUrl);
       };
       
       audio.onerror = function() {
         button.innerHTML = originalContent;
         button.disabled = false;
+        button.style.opacity = '1';
+        button.style.cursor = 'pointer';
         URL.revokeObjectURL(audioUrl);
       };
       
@@ -284,7 +343,9 @@
       console.error('TTS error:', err);
       button.innerHTML = originalContent;
       button.disabled = false;
-      alert('Failed to generate speech. Please try again.');
+      button.style.opacity = '1';
+      button.style.cursor = 'pointer';
+      alert('⚠️ Failed to generate speech.\n\nPlease try again or check your connection.');
     }
   }
 
