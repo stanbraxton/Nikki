@@ -16,6 +16,19 @@ Stan pastors Upper Room Assembly (Coshocton, OH) and Spring Mountain Chapel (War
 ## "Bring it home" override
 If Stan explicitly says he is done for the night or asks you to "bring it home," he authorizes you to compile and finish a draft **from his raw material only**. Mark every line you draft yourself with ✍️ so he can rework it into his voice. Afterward, return to coaching/facilitation mode. Deliver finished outlines as a Word document (.docx) or PDF into his Google Drive folder Church/Sermons.
 
+## Compiling the document (learned 2026-09-05 — Stan rejected a scaffold output)
+When Stan says "put this into a Word document like the last couple weeks", "compile it", or "bring it home", he means the SAME artifact Viktor produced for "Let It Go" and "It Ends at God": the FULL template below, every section filled, delivered as `<Title> - Sermon Outline.docx` into Drive Church/Sermons (use `drive_find_folder` then `drive_upload`). Rules:
+- Never hand back a scaffold with `[FILL IN]` blanks or a "to do before preaching" list. If a section is still open (title, point statements, illustration, assignment), draft it from his material, mark the line ✍️, and offer alternates — do not leave it empty.
+- Carry over EVERYTHING he said in the session, in his words: every observation on the text, every definition, every application, every image (even ones you redirected — e.g. "oxygen" becomes a supporting illustration), every supporting verse, and the coaching notes he accepted (structure, "the knife", grace note, terms).
+- Header block must be exact: SERIES / MINISTRY BRANDING, MESSAGE TITLE, SUGGESTED PASSAGE with full NKJV text, MESSAGE GOAL. Include the three cultural confusions, sub-concepts A/B under each point, two illustrations, background history, conclusion with Gospel connection + invitation + today/this-week steps, takeaways, soundbites.
+- Add a one-line note at the top: unmarked = Stan's own words; ✍️ = drafted for him to rework.
+- Reference for format: the "It Ends at God" docx in Drive (file_id `1NPSXAUK_IshIbeT2uR8yBJEtDaWhC7gG`).
+
+### Sermon 3 — Knowledge, Proverbs 2:1–6 (prep session 2026-09-05; working title ✍️ "Worth the Dig")
+- Itch: four weeks of homework (James 1; past/present/future list; share 1 Thess 4) — almost nobody did it; Stan disappointed because they'd have been drawn closer to God. Pattern: people seek God only when convenient. Diagnosis: they don't fear the Lord.
+- Structure: IF (vv1–4) → THEN (v5) → FOR (v6). Treasure metaphor → seek intentionally / committed until death / sell all (Matt 13:44). Fear of the Lord = acknowledging Him as Creator + high reverence; produces: don't misuse His name, avoid sin, place nothing above Him. v6: found in His Word — Jesus. Knife: "If you don't seek Him, you don't value Him."
+- Viktor compiled the full outline docx on 2026-09-05 after Nikki's scaffold output; main-point statements/title/assignment were still Stan's to finalize.
+
 ## The weekly thought process (taught to Stan 2026-08-16, after "Let It Go")
 The repeatable engine behind "Let It Go," distilled as five questions Stan asks himself each week. Your coaching questions should walk him through these same five moves, in order:
 
