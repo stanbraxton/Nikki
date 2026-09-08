@@ -44,7 +44,7 @@ async def run_prompt(prompt: str, thread_id: str, auto_approve: bool = False, mo
             calls = pending_tool_calls(state)
             for tc in calls:
                 await persistence.trace(thread_id, "tool_call", tc)
-            gated = [tc for tc in calls if registry.requires_approval(tc["name"])]
+            gated = [tc for tc in calls if registry.requires_approval(tc["name"], tc.get("args"))]
             if gated and not auto_approve:
                 await persistence.trace(thread_id, "approval", {"approved": False, "tools": [tc["name"] for tc in gated], "reason": "headless"})
                 await graph.aupdate_state(

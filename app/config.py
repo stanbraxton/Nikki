@@ -29,7 +29,10 @@ class Settings:
     # (e.g. Anthropic "credit balance is too low"). Empty string disables the fallback.
     fallback_model: str | None = _env("NIKKI_FALLBACK_MODEL", "openai:gpt-4.1-mini")
     # Approx. token budget for conversation history sent to the model (system prompt excluded).
+    # The small default protects the OpenAI fallback (30k TPM org cap); Anthropic models get a much
+    # larger window so long debugging threads keep their earlier errors and findings.
     history_budget_tokens: int = int(_env("NIKKI_HISTORY_BUDGET_TOKENS", "24000"))
+    history_budget_tokens_anthropic: int = int(_env("NIKKI_HISTORY_BUDGET_TOKENS_ANTHROPIC", "80000"))
     # tool results from earlier turns are shortened to this many chars before being re-sent (0 = off)
     old_tool_result_chars: int = int(_env("NIKKI_OLD_TOOL_RESULT_CHARS", "1500"))
     max_tokens: int = int(_env("NIKKI_MAX_TOKENS", "4096"))

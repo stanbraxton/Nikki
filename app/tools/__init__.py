@@ -43,9 +43,9 @@ class ToolRegistry:
     def _load_builtin(self) -> None:
         if self._builtin:
             return
-        from app.tools import browser, custom_api, db_query, documents, engineer, files, google_ws, images, knowledge, memory, microsoft, scheduler, self_maintain, sermon, spaces, speech, sports, web
+        from app.tools import browser, custom_api, db_query, documents, engineer, files, google_ws, images, jobs, knowledge, memory, microsoft, scheduler, self_maintain, sermon, spaces, speech, sports, web
 
-        for mod in (files, db_query, self_maintain, spaces, engineer, knowledge, images, browser, speech, sports):  # platform-admin only
+        for mod in (files, db_query, self_maintain, spaces, engineer, knowledge, images, browser, speech, sports, jobs):  # platform-admin only
             for t in mod.TOOLS:
                 t.metadata = {**(t.metadata or {}), "admin_only": True}
             self._builtin.extend(mod.TOOLS)
@@ -123,11 +123,22 @@ class ToolRegistry:
     def by_name(self) -> dict[str, BaseTool]:
         return {t.name: t for t in self.tools(admin=True)}
 
-    def requires_approval(self, tool_name: str) -> bool:
+    def requires_approval(self, tool_name: str, args: dict | None = None) -> bool:
+        """Static `requires_approval` flag, or a per-call `requires_approval_if(args)` predicate
+        (e.g. http_request gates only mutating methods)."""
         t = self.by_name().get(tool_name)
         if t is None:
             return True
-        return bool((t.metadata or {}).get("requires_approval", False))
+        meta = t.metadata or {}
+        if meta.get("requires_approval"):
+            return True
+        pred = meta.get("requires_approval_if")
+        if callable(pred):
+            try:
+                return bool(pred(args or {}))
+            except Exception:  # noqa: BLE001 — be safe
+                return True
+        return False
 
     def skill_report(self) -> list[dict]:
         self.refresh_skills()

@@ -10,6 +10,8 @@ import re
 import socket
 from urllib.parse import urlparse
 
+import json
+
 import httpx
 from bs4 import BeautifulSoup
 from langchain_core.tools import tool
@@ -131,7 +133,60 @@ def web_search(query: str, max_results: int = 6) -> str:
         return f"error: search failed: {type(e).__name__}: {e}"
 
 
+@tool
+def http_request(
+    method: str,
+    url: str,
+    headers: dict | None = None,
+    json_body: dict | list | None = None,
+    body: str | None = None,
+    cookies: list | dict | None = None,
+    max_chars: int = 8000,
+) -> str:
+    """Call a web API directly: any HTTP method, custom headers, JSON or raw body, and cookies (the list from
+    browser_cookies or a {name: value} dict). Returns status, response headers of interest and the body text.
+    Use it to replay calls discovered with browser_network — a site's own JSON API is faster and far more reliable
+    than clicking through its UI. GET/HEAD/OPTIONS run without approval; anything that changes data
+    (POST/PUT/PATCH/DELETE) is approval-gated."""
+    p = urlparse(url)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        return "error: only http(s) URLs are allowed"
+    if (why := _blocked_host(p.hostname)):
+        return f"error: {why}"
+    method = method.upper()
+    ck: dict[str, str] = {}
+    if isinstance(cookies, dict):
+        ck = {str(k): str(v) for k, v in cookies.items()}
+    elif isinstance(cookies, list):
+        ck = {str(c.get("name")): str(c.get("value")) for c in cookies if isinstance(c, dict) and c.get("name")}
+    hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36",
+            **{str(k): str(v) for k, v in (headers or {}).items()}}
+    try:
+        with httpx.Client(follow_redirects=True, timeout=40, headers=hdrs, cookies=ck) as c:
+            r = c.request(method, url, json=json_body if json_body is not None else None, content=body if body is not None and json_body is None else None)
+    except httpx.HTTPError as e:
+        return f"error: {type(e).__name__}: {e}"
+    ct = r.headers.get("content-type", "")
+    text = r.text
+    if "json" in ct:
+        try:
+            text = json.dumps(r.json(), indent=1)
+        except ValueError:
+            pass
+    elif "html" in ct:
+        text = _clean(text)
+    if len(text) > max_chars:
+        text = text[:max_chars] + f"\n[... {len(text) - max_chars:,} more chars]"
+    set_cookie = "; ".join(f"{k}={v}" for k, v in r.cookies.items())
+    return f"HTTP {r.status_code} {method} {r.url}\ncontent-type: {ct}" + (f"\nnew cookies: {set_cookie[:600]}" if set_cookie else "") + f"\n\n{text}"
+
+
+def _http_request_gate(args: dict) -> bool:
+    return str(args.get("method", "GET")).upper() not in ("GET", "HEAD", "OPTIONS")
+
+
 for _t in (web_search, http_fetch):
     _t.metadata = {"requires_approval": False}
+http_request.metadata = {"requires_approval": False, "requires_approval_if": _http_request_gate}
 
-TOOLS = [web_search, http_fetch]
+TOOLS = [web_search, http_fetch, http_request]

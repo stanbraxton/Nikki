@@ -7,13 +7,20 @@ threads). Pages are described as a numbered list of interactive elements; the mo
 Tools: browser_open, browser_snapshot, browser_click, browser_type, browser_select, browser_scroll,
 browser_back, browser_screenshot, browser_close. Screenshots are saved to the workspace and attached
 to the chat via the artifacts FILE_MARK.
+
+Network capture: every XHR/fetch the page makes is recorded (method, URL, request body, status,
+response snippet). browser_network lists them, browser_network_detail shows one in full,
+browser_cookies exports the session cookies — together they let a skill replay the site's own
+JSON API with http_request instead of clicking through the UI.
 """
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import threading
 import time
+from collections import deque
 from typing import Any, Callable
 
 from langchain_core.tools import tool
@@ -25,6 +32,10 @@ log = logging.getLogger("nikki.browser")
 IDLE_TIMEOUT_S = 15 * 60
 MAX_TEXT = 12_000
 NAV_TIMEOUT_MS = 30_000
+NET_KEEP = 400            # captured API calls kept per session
+NET_BODY_CHARS = 4_000    # request/response body stored per call
+_CAPTURE_TYPES = {"xhr", "fetch"}
+_TEXT_CT = ("json", "text", "javascript", "xml", "x-www-form-urlencoded")
 
 _INTERACTIVE = (
     "a[href], button, input:not([type=hidden]), select, textarea, [role=button], [role=link], "
@@ -62,6 +73,8 @@ class _Worker:
     def __init__(self) -> None:
         self.q: queue.Queue[tuple[Callable[[], Any], queue.Queue]] = queue.Queue()
         self.pw = self.browser = self.context = self.page = None
+        self.net: deque[dict] = deque(maxlen=NET_KEEP)
+        self._net_seq = 0
         self.last_used = time.time()
         self.thread = threading.Thread(target=self._loop, name="nikki-browser", daemon=True)
         self.thread.start()
@@ -104,12 +117,48 @@ class _Worker:
             )
             self.context.set_default_timeout(NAV_TIMEOUT_MS)
             self.context.on("page", self._adopt_page)
+            self.context.on("request", self._on_request)
+            self.context.on("requestfinished", self._on_finished)
         self.page = self.context.new_page()
         return self.page
 
     def _adopt_page(self, page) -> None:
         # follow target=_blank navigations
         self.page = page
+
+    # ----- network capture (runs on the worker thread via Playwright's dispatcher)
+    def _on_request(self, req) -> None:
+        try:
+            if req.resource_type not in _CAPTURE_TYPES:
+                return
+            self._net_seq += 1
+            body = req.post_data or ""
+            rec = {"id": self._net_seq, "t": time.strftime("%H:%M:%S"), "method": req.method, "url": req.url,
+                   "request_headers": {k: v for k, v in req.headers.items() if k.lower() in ("content-type", "accept", "x-requested-with") or k.lower().startswith("x-")},
+                   "request_body": body[:NET_BODY_CHARS], "status": None, "response_body": ""}
+            req._nikki_rec = rec  # noqa: SLF001
+            self.net.append(rec)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_finished(self, req) -> None:
+        try:
+            rec = getattr(req, "_nikki_rec", None)
+            if rec is None:
+                return
+            resp = req.response()
+            if resp is None:
+                return
+            rec["status"] = resp.status
+            ct = (resp.headers.get("content-type") or "").lower()
+            if any(t in ct for t in _TEXT_CT):
+                try:
+                    rec["response_body"] = resp.text()[:NET_BODY_CHARS]
+                except Exception:  # noqa: BLE001 — body not available (redirect, aborted)
+                    rec["response_body"] = ""
+            rec["content_type"] = ct[:60]
+        except Exception:  # noqa: BLE001
+            pass
 
     def _close(self) -> None:
         for obj in (self.context, self.browser):
@@ -119,6 +168,7 @@ class _Worker:
             except Exception:  # noqa: BLE001
                 pass
         self.context = self.browser = self.page = None
+        self.net.clear()
 
 
 _worker: _Worker | None = None
@@ -288,6 +338,63 @@ def browser_screenshot(full_page: bool = False) -> str:
     return _run(act)
 
 
+def _short(rec: dict) -> str:
+    body = rec["request_body"].replace("\n", " ")
+    return (f"#{rec['id']} {rec['t']} {rec['method']} {rec['status'] or '…'} {rec['url'][:160]}"
+            + (f"\n      body: {body[:200]}" if body else ""))
+
+
+@tool
+def browser_network(filter: str = "", limit: int = 25, clear: bool = False) -> str:
+    """List the JSON/XHR/fetch API calls the current browser session has made (newest last): id, time, method,
+    status, URL and request body preview. `filter` is a case-insensitive substring on URL/method/body.
+    Use this after doing an action in the UI (add to cart, search, login) to learn the site's own API, then
+    browser_network_detail(id) for the full request/response and http_request to replay it without the UI.
+    clear=True empties the log first (do that right before the action you want to capture)."""
+    try:
+        w = _w()
+        if clear:
+            w.net.clear()
+            return "network log cleared"
+        recs = list(w.net)
+    except Exception as e:  # noqa: BLE001
+        return f"browser error: {e}"
+    if filter:
+        f = filter.lower()
+        recs = [r for r in recs if f in r["url"].lower() or f in r["method"].lower() or f in r["request_body"].lower()]
+    if not recs:
+        return "no API calls captured yet (only XHR/fetch requests are recorded; open the page and perform the action first)"
+    recs = recs[-max(1, min(limit, 100)):]
+    return f"{len(recs)} call(s):\n" + "\n".join(_short(r) for r in recs)
+
+
+@tool
+def browser_network_detail(id: int) -> str:
+    """Full record of one captured API call from browser_network: method, URL, request headers, request body,
+    response status and response body (up to 4k chars each). Everything needed to replay it with http_request."""
+    try:
+        rec = next((r for r in _w().net if r["id"] == id), None)
+    except Exception as e:  # noqa: BLE001
+        return f"browser error: {e}"
+    if rec is None:
+        return f"no captured call #{id} (browser_network lists what is available)"
+    return json.dumps(rec, indent=1)[:12_000]
+
+
+@tool
+def browser_cookies(domain_filter: str = "") -> str:
+    """Export the browser session's cookies as JSON [{name, value, domain, path}] — pass them as `cookies` to
+    http_request to reuse a login the user completed in the browser. Contains session secrets: never write them
+    into a skill file or a message; keep them in memory for the current task only."""
+    def act(page):
+        cks = page.context.cookies()
+        if domain_filter:
+            cks = [c for c in cks if domain_filter.lower() in (c.get("domain") or "").lower()]
+        return json.dumps([{k: c.get(k) for k in ("name", "value", "domain", "path")} for c in cks])
+
+    return _run(act)
+
+
 @tool
 def browser_close() -> str:
     """Close the browser session (drops cookies/logins). Do this when a task involving a login is done."""
@@ -299,9 +406,10 @@ def browser_close() -> str:
         return f"browser error: {e}"
 
 
-for _t in (browser_open, browser_snapshot, browser_scroll, browser_back, browser_screenshot, browser_close):
+for _t in (browser_open, browser_snapshot, browser_scroll, browser_back, browser_screenshot, browser_close, browser_network, browser_network_detail, browser_cookies):
     _t.metadata = {"requires_approval": False}
 for _t in (browser_click, browser_type, browser_select):
     _t.metadata = {"requires_approval": False}  # navigation-level actions; purchases/sends still need the user's say-so via prompt rules
 
-TOOLS = [browser_open, browser_snapshot, browser_click, browser_type, browser_select, browser_scroll, browser_back, browser_screenshot, browser_close]
+TOOLS = [browser_open, browser_snapshot, browser_click, browser_type, browser_select, browser_scroll, browser_back, browser_screenshot,
+         browser_network, browser_network_detail, browser_cookies, browser_close]

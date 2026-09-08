@@ -289,7 +289,7 @@ async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "Tu
         if not state.next:
             break
         calls = pending_tool_calls(state)
-        gated = [tc for tc in calls if registry.requires_approval(tc["name"])]
+        gated = [tc for tc in calls if registry.requires_approval(tc["name"], tc.get("args"))]
         if gated:
             approved = await ask_approval(gated)
             await persistence.trace(thread_id, "approval", {"approved": approved, "tools": [tc["name"] for tc in gated]})

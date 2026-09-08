@@ -6,16 +6,21 @@ Anything the skill does at runtime requires approval unless the file sets
 `REQUIRES_APPROVAL = False`.
 
 Every write goes through the approval gate. Before saving, the source is compiled,
-checked for obviously dangerous imports, and imported in isolation so a broken skill
+checked for obviously dangerous imports, imported in isolation, and then one of its tools
+is actually EXECUTED in a subprocess (`test_call`) so a broken or half-finished skill
 never reaches the live registry.
 """
 from __future__ import annotations
 
 import ast
 import importlib.util
+import json
+import os
 import re
+import subprocess
 import sys
 import traceback
+from pathlib import Path
 
 from langchain_core.tools import BaseTool, tool
 
@@ -108,6 +113,76 @@ def _trial_import(name: str, source: str) -> tuple[list[str], str | None]:
     return [t.name for t in tools if isinstance(t, BaseTool)], None
 
 
+_APP_ROOT = Path(__file__).resolve().parents[2]
+_TEST_TIMEOUT_S = 120
+_FAIL_MARKERS = ("traceback (most recent call last)", "error:", "exception", "browser error", "not implemented", "placeholder")
+
+_RUNNER = r"""
+import json, sys, traceback, importlib.util
+src = json.load(sys.stdin)["src"]
+call = json.load(open(sys.argv[1]))
+tool_name, args = call["tool"], call["args"]
+spec = importlib.util.spec_from_loader("nikki_skill_under_test", loader=None)
+mod = importlib.util.module_from_spec(spec)
+try:
+    exec(compile(src, "<skill under test>", "exec"), mod.__dict__)
+    from langchain_core.tools import BaseTool
+    tools = mod.__dict__.get("TOOLS") or [v for v in mod.__dict__.values() if isinstance(v, BaseTool)]
+    t = next((t for t in tools if t.name == tool_name), None)
+    if t is None:
+        print(json.dumps({"ok": False, "out": f"no tool named {tool_name!r}; available: {[x.name for x in tools]}"})); sys.exit(0)
+    out = t.invoke(args)
+    print(json.dumps({"ok": True, "out": str(out)}))
+except BaseException:
+    print(json.dumps({"ok": False, "out": traceback.format_exc(limit=6)}))
+"""
+
+
+def _run_test(source: str, test_call: dict) -> tuple[bool, str]:
+    """Execute `test_call = {"tool": name, "args": {...}}` against the candidate source in a fresh
+    subprocess (same interpreter, same env, PYTHONPATH=app root) and return (passed, output)."""
+    tool_name = str(test_call.get("tool") or "")
+    args = test_call.get("args") or {}
+    if not tool_name or not isinstance(args, dict):
+        return False, "test_call must be {\"tool\": \"<tool name>\", \"args\": {...}}"
+    spec_file = Path(os.environ.get("TMPDIR", "/tmp")) / f"nikki_skill_test_{os.getpid()}.json"
+    spec_file.write_text(json.dumps({"tool": tool_name, "args": args}), encoding="utf-8")
+    env = {**os.environ, "PYTHONPATH": f"{_APP_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}", "NIKKI_SKILL_TEST": "1"}
+    try:
+        r = subprocess.run([sys.executable, "-c", _RUNNER, str(spec_file)], input=json.dumps({"src": source}), capture_output=True,
+                           text=True, timeout=_TEST_TIMEOUT_S, env=env, cwd=str(_APP_ROOT))
+    except subprocess.TimeoutExpired:
+        return False, f"test timed out after {_TEST_TIMEOUT_S}s (the tool hung or waits for input)"
+    finally:
+        spec_file.unlink(missing_ok=True)
+    line = (r.stdout.strip().splitlines() or [""])[-1]
+    try:
+        res = json.loads(line)
+    except json.JSONDecodeError:
+        return False, f"test process crashed (exit {r.returncode}):\n{(r.stderr or r.stdout)[-1500:]}"
+    out = str(res.get("out", ""))
+    if not res.get("ok"):
+        return False, out[-2000:]
+    low = out.lower()[:400]
+    if not out.strip():
+        return False, "tool returned an empty result"
+    if any(m in low for m in _FAIL_MARKERS):
+        return False, f"tool ran but its result looks like a failure:\n{out[:1200]}"
+    return True, out
+
+
+@tool
+def test_skill(source: str, tool: str, args: dict | None = None) -> str:
+    """Run one tool from a candidate skill source with real `args` in an isolated subprocess and return what it
+    produced (or the traceback). Use it while developing a skill; write_skill runs the same test before saving."""
+    problems = _validate("candidate", source)
+    problems = [p for p in problems if not p.startswith("name must")]
+    if problems:
+        return "rejected before running:\n- " + "\n- ".join(problems)
+    ok, out = _run_test(source, {"tool": tool, "args": args or {}})
+    return ("PASS\n" if ok else "FAIL\n") + out[:4000]
+
+
 @tool
 def list_skills() -> str:
     """Show the user-authored skills currently loaded, the tools they provide, and any load errors."""
@@ -136,9 +211,12 @@ def skill_template(name: str, description: str = "Describe what this skill does.
 
 
 @tool
-def write_skill(name: str, source: str) -> str:
-    """Create or replace a skill file `<name>.py` with the given Python source, validate it, and hot-load it.
-    The source must define @tool functions from langchain_core.tools (or a TOOLS list). Requires approval."""
+def write_skill(name: str, source: str, test_call: dict) -> str:
+    """Create or replace a skill file `<name>.py` with the given Python source, validate it, RUN it, and hot-load it.
+    The source must define @tool functions from langchain_core.tools (or a TOOLS list).
+    `test_call` is mandatory: {"tool": "<one of the skill's tools>", "args": {...real arguments...}}; the tool is
+    executed in a subprocess and the skill is saved only if it returns a non-error result. Pick a safe, read-only
+    or reversible call for the test. Requires approval."""
     problems = _validate(name, source)
     if problems:
         return "rejected:\n- " + "\n- ".join(problems)
@@ -147,6 +225,13 @@ def write_skill(name: str, source: str) -> str:
         return f"rejected: skill failed to import:\n{err}"
     if not tool_names:
         return "rejected: no @tool functions found"
+    if not isinstance(test_call, dict) or not test_call.get("tool"):
+        return "rejected: test_call is required — {\"tool\": \"<tool name>\", \"args\": {...}}; a skill is never saved untested"
+    if test_call["tool"] not in tool_names:
+        return f"rejected: test_call.tool {test_call['tool']!r} is not defined by this skill (tools: {', '.join(tool_names)})"
+    passed, test_out = _run_test(source, test_call)
+    if not passed:
+        return f"rejected: test call {test_call['tool']}({json.dumps(test_call.get('args') or {})[:200]}) failed — fix the code and try again:\n{test_out}"
     path = settings.skills_dir / f"{name}.py"
     existed = path.exists()
     path.write_text(source, encoding="utf-8")
@@ -157,7 +242,7 @@ def write_skill(name: str, source: str) -> str:
     mine = next((r for r in st if r["file"] == path.name), None)
     if mine and mine["error"]:
         return f"saved but failed to load: {mine['error'].splitlines()[-1]}"
-    return f"{'updated' if existed else 'created'} skill {name}; live tools: {', '.join(tool_names)}"
+    return f"{'updated' if existed else 'created'} skill {name}; live tools: {', '.join(tool_names)}\ntest {test_call['tool']} passed, returned: {test_out[:600]}"
 
 
 @tool
@@ -175,7 +260,7 @@ def delete_skill(name: str) -> str:
 
 for _t in (list_skills, read_skill, skill_template):
     _t.metadata = {"requires_approval": False}
-for _t in (write_skill, delete_skill):
-    _t.metadata = {"requires_approval": True}
+for _t in (test_skill, write_skill, delete_skill):
+    _t.metadata = {"requires_approval": True}  # test_skill executes model-written code
 
-TOOLS = [list_skills, read_skill, skill_template, write_skill, delete_skill]
+TOOLS = [list_skills, read_skill, skill_template, test_skill, write_skill, delete_skill]

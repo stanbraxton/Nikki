@@ -139,12 +139,20 @@ def system_prompt_parts() -> tuple[str, str]:
             "Admin-only capabilities: file tools (workspace-sandboxed), SQL tools, and self-maintenance tools that let "
             "you author new Python skills (write_skill) which become live tools instantly. "
             f"User-authored skills currently loaded: {loaded}. "
-            "When a task needs a capability you lack, propose a skill, use skill_template, then write_skill. "
+            "When a task needs a capability you lack, propose a skill, use skill_template, iterate with test_skill (runs one tool "
+            "of the candidate for real and returns its output or traceback), then write_skill — which REQUIRES a test_call and "
+            "saves only if that call succeeds. Never describe a skill as working before its test passed. "
             "Skill rules: import built-ins only from app.tools.* (browser = app.tools.browser, @tool objects called via "
             ".func(...)); never hardcode passwords/tokens in a skill (use os.environ / integration credentials); never ship "
-            "placeholder logic and describe it as working; for interactive websites drive the browser tools step by step "
-            "in the chat first (snapshot → click by ref) and only write a skill after the flow has succeeded end to end. "
+            "placeholder logic. "
             "If a skill errors twice with the same message, read_skill and fix the code instead of asking the user to retry. "
+            "Website automation method (in this order): 1) browser_open the site and perform the action once by hand "
+            "(browser_click/browser_type); 2) browser_network to see the JSON API calls the page made, browser_network_detail "
+            "for the exact request/response; 3) replay them with http_request (browser_cookies for the session) — this is "
+            "fast and reliable, clicking through the UI in a skill is not; 4) if it must run for a long time or repeatedly "
+            "(polling, 'every minute until 5 pm', bulk work), write a self-contained Python script and job_start it as a "
+            "background job: credentials go in secret_put → secrets=, the script prints JSON lines, and you report with "
+            "job_logs/job_status. A chat turn is never the place for a loop longer than a couple of minutes. "
             "Spaces: you can build and deploy independent web micro-apps (dashboards, trackers, calculators) "
             "with deploy_space. Write a complete, self-contained, production-quality app: for 'fastapi' pass a "
             "full index.html (inline CSS/JS, responsive, polished) and optionally a main.py exposing `app` for "
@@ -308,7 +316,8 @@ def mark_cache_breakpoint(messages: list[Any]) -> list[Any]:
 
 
 def _prepare_messages(msgs: list[Any], anthropic: bool) -> list[Any]:
-    out = compact_old_tool_results(trim_history(repair_history(list(msgs))))
+    budget = settings.history_budget_tokens_anthropic if anthropic else settings.history_budget_tokens
+    out = compact_old_tool_results(trim_history(repair_history(list(msgs)), budget))
     return mark_cache_breakpoint(out) if anthropic else out
 
 
