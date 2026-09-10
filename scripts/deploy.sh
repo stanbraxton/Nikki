@@ -17,7 +17,7 @@ gcloud builds submit --tag "$IMAGE" -q .
 echo "== deploy"
 gcloud run deploy "$SERVICE" --image "$IMAGE" --region "$REGION" --platform managed \
   --service-account "$RUNTIME_SA" --allow-unauthenticated \
-  --cpu 1 --memory 1Gi --min-instances "${MIN_INSTANCES:-1}" --max-instances 2 --concurrency 20 \
+  --cpu 1 --memory 2Gi --min-instances "${MIN_INSTANCES:-1}" --max-instances 2 --concurrency 20 \
   --timeout 3600 --session-affinity \
   --add-cloudsql-instances "$CONN" \
   --add-volume name=data,type=cloud-storage,bucket="$BUCKET" \
