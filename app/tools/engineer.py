@@ -40,6 +40,9 @@ GIT_AUTHOR = ("Nikki", "nikki@nikkiaia.com")
 READ_ONLY_GIT = {"status", "log", "diff", "show", "branch", "ls-files", "blame", "stash", "checkout", "switch",
                  "add", "reset", "restore", "rm", "mv", "fetch", "pull", "merge", "rebase", "tag", "rev-parse"}
 SECRET_ENV_RE = re.compile(r"(KEY|SECRET|TOKEN|PASSWORD|DATABASE_URL|CREDENTIALS)", re.I)
+TEMPLATE_REPO_DEFAULT = "stanbraxton/nikki-app-template"
+TEMPLATE_PLACEHOLDERS = ("__APP_NAME__", "__APP_DESCRIPTION__", "__APP_SLUG__", "__FIREBASE_SITE__")
+TEXT_SUFFIXES = {".ts", ".tsx", ".js", ".mjs", ".json", ".md", ".html", ".css", ".txt", ".yaml", ".yml", ".toml", ".example"}
 
 
 def _cfg(name: str, default: str | None = None) -> str | None:
@@ -369,6 +372,47 @@ def _store_secret(name: str, value: str) -> None:
                    check=True, capture_output=True, text=True)
 
 
+def _read_secret(name: str) -> str | None:
+    p = project()
+    r = subprocess.run([gcloud_bin(), "secrets", "versions", "access", "latest", "--secret", name, "--project", p],
+                       capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def _convex_env_secret(slug: str) -> str:
+    return f"nikki-app-{slug}-convex-env"
+
+
+def _convex_env(slug: str) -> dict[str, str]:
+    raw = _read_secret(_convex_env_secret(slug))
+    if not raw or not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except ValueError:
+        return {}
+
+
+def _generate_auth_keys() -> tuple[str, str]:
+    """Convex Auth key pair: (JWT_PRIVATE_KEY PKCS8 PEM, JWKS JSON). Mirrors @convex-dev/auth generateKeys."""
+    import base64
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                            serialization.NoEncryption()).decode()
+    pub = key.public_key().public_numbers()
+
+    def b64u(n: int, length: int) -> str:
+        return base64.urlsafe_b64encode(n.to_bytes(length, "big")).rstrip(b"=").decode()
+
+    jwk = {"use": "sig", "kty": "RSA", "n": b64u(pub.n, 256), "e": b64u(pub.e, 3), "alg": "RS256"}
+    return pem, json.dumps({"keys": [jwk]})
+
+
 # ------------------------------------------------------------------ app registry
 def _app(slug: str) -> dict | None:
     with persistence.sync_engine().connect() as c:
@@ -450,6 +494,13 @@ def _cloudbuild_yaml(app: dict) -> tuple[str, str]:
         {"name": "oven/bun:1", "id": "install", "entrypoint": "bash",
          "args": ["-c", "bun install --frozen-lockfile || bun install"]},
     ]
+    has_env = bool(app.get("convex_secret")) and bool(_convex_env(app["slug"]))
+    if has_env:
+        steps.append({
+            "name": "oven/bun:1", "id": "convex-env", "entrypoint": "bash",
+            "secretEnv": ["CONVEX_DEPLOY_KEY", "CONVEX_ENV_JSON"],
+            "args": ["-c", "bun run .nikki/convex_env.mjs"],
+        })
     if app.get("convex_secret"):
         steps.append({
             "name": "oven/bun:1", "id": "convex+build", "entrypoint": "bash", "secretEnv": ["CONVEX_DEPLOY_KEY"],
@@ -463,11 +514,26 @@ def _cloudbuild_yaml(app: dict) -> tuple[str, str]:
     })
     cfg: dict = {"steps": steps, "timeout": "1500s", "options": {"logging": "CLOUD_LOGGING_ONLY"}}
     if app.get("convex_secret"):
-        cfg["availableSecrets"] = {"secretManager": [
-            {"versionName": f"projects/{p}/secrets/{app['convex_secret']}/versions/latest", "env": "CONVEX_DEPLOY_KEY"}]}
+        secrets = [{"versionName": f"projects/{p}/secrets/{app['convex_secret']}/versions/latest", "env": "CONVEX_DEPLOY_KEY"}]
+        if has_env:
+            secrets.append({"versionName": f"projects/{p}/secrets/{_convex_env_secret(app['slug'])}/versions/latest",
+                            "env": "CONVEX_ENV_JSON"})
+        cfg["availableSecrets"] = {"secretManager": secrets}
     firebase_json = {"hosting": {"site": site, "public": build_dir, "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
                                  "rewrites": [{"source": "**", "destination": "/index.html"}]}}
     return json.dumps(cfg, indent=2), json.dumps(firebase_json, indent=2)
+
+
+CONVEX_ENV_SCRIPT = """// Sets Convex production env vars from the CONVEX_ENV_JSON secret (idempotent).
+import { spawnSync } from "node:child_process";
+const env = JSON.parse(process.env.CONVEX_ENV_JSON || "{}");
+for (const [name, value] of Object.entries(env)) {
+  if (!/^[A-Z][A-Z0-9_]*$/.test(name)) { console.error(`skip bad name ${name}`); continue; }
+  const r = spawnSync("bunx", ["convex", "env", "set", name, "--", String(value)], { stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" });
+  if (r.status !== 0) { console.error(`convex env set ${name} failed:\\n${(r.stderr || r.stdout || "").slice(-800)}`); process.exit(1); }
+  console.log(`set ${name}`);
+}
+"""
 
 
 def _stage_dir(app: dict, bid: str) -> Path:
@@ -498,6 +564,8 @@ def _stage_dir(app: dict, bid: str) -> Path:
     else:
         fbp.write_text(fb)
     (stage / ".gcloudignore").write_text("node_modules\n.git\ndist\n")
+    (stage / ".nikki").mkdir(exist_ok=True)
+    (stage / ".nikki" / "convex_env.mjs").write_text(CONVEX_ENV_SCRIPT)
     return stage
 
 
@@ -804,10 +872,155 @@ def deploy_self() -> str:
         return f"error: {e}"
 
 
+# ------------------------------------------------------------------ scaffolding from the starter template
+def _replace_placeholders(root: Path, mapping: dict[str, str]) -> int:
+    changed = 0
+    for f in root.rglob("*"):
+        if not f.is_file() or ".git" in f.parts or "node_modules" in f.parts:
+            continue
+        if f.suffix not in TEXT_SUFFIXES and f.name not in {".env.example", ".gitignore"}:
+            continue
+        try:
+            txt = f.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        out = txt
+        for k, v in mapping.items():
+            out = out.replace(k, v)
+        if out != txt:
+            f.write_text(out, encoding="utf-8")
+            changed += 1
+    return changed
+
+
+@tool
+def scaffold_app(
+    slug: str,
+    title: str,
+    description: str = "",
+    firebase_site: str = "",
+    template_repo: str = "",
+) -> str:
+    """Create a NEW full-stack app from the starter template (React/Vite/Tailwind + Convex Auth + multi-tenant
+    orgs + Firebase Hosting). Requires approval. Creates a private GitHub repo `<owner>/<slug>`, fills in the
+    app name/description, commits and pushes, creates the Firebase Hosting site, generates the Convex Auth key
+    pair and stores it (with SITE_URL and ADMIN_SECRET) as the app's Convex env, and registers the app.
+    Afterwards the ONLY manual step is a Convex production deploy key from the owner: call
+    `register_app(slug, title, repo, convex_deploy_key=...)` with it, then `deploy_app(slug)`.
+    Then open the repo and build the real domain on top (see README.md in the repo)."""
+    slug = slug.strip().lower()
+    if not SLUG_RE.match(slug):
+        return "rejected: slug must match ^[a-z][a-z0-9-]{1,30}$"
+    title = title.strip()
+    if len(title) < 2:
+        return "rejected: title required"
+    tok = github_token()
+    if not tok:
+        return "error: GITHUB_TOKEN not configured"
+    if not project():
+        return "rejected: GCP project not configured"
+    tpl = (template_repo.strip() or _cfg("APP_TEMPLATE_REPO") or TEMPLATE_REPO_DEFAULT)
+    if not REPO_RE.match(tpl):
+        return "rejected: template_repo must be owner/name"
+    site = (firebase_site.strip() or slug).lower()
+    headers = {"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"}
+    try:
+        owner = httpx.get("https://api.github.com/user", headers=headers, timeout=30).json().get("login")
+        if not owner:
+            return "error: could not resolve GitHub owner from token"
+        repo = f"{owner}/{slug}"
+        if httpx.get(f"https://api.github.com/repos/{repo}", headers=headers, timeout=30).status_code == 200:
+            return f"error: repo {repo} already exists — pick another slug or use repo_open/register_app"
+
+        # 1) template → fresh working tree
+        work = _repo_dir(repo)
+        if work.exists():
+            shutil.rmtree(work)
+        r = subprocess.run(["git", "clone", "--depth", "1", _remote(tpl), str(work)], capture_output=True, text=True,
+                           timeout=300, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+        if r.returncode != 0:
+            return f"error: template clone failed: {(r.stdout + r.stderr).replace(tok, '***')[-600:]}"
+        shutil.rmtree(work / ".git")
+        desc = description.strip() or f"{title} — built on the Nikki app platform."
+        n = _replace_placeholders(work, {"__APP_NAME__": title, "__APP_DESCRIPTION__": desc,
+                                         "__APP_SLUG__": slug, "__FIREBASE_SITE__": site})
+
+        # 2) new private repo + first push
+        cr = httpx.post("https://api.github.com/user/repos", headers=headers, timeout=30,
+                        json={"name": slug, "private": True, "description": desc[:300], "auto_init": False})
+        if cr.status_code >= 300:
+            return f"error creating repo {cr.status_code}: {cr.text[:300]}"
+        _git(work, "init", "-q", "-b", "main")
+        _git(work, "remote", "add", "origin", _remote(repo))
+        _git(work, "add", "-A")
+        _git(work, "commit", "-q", "-m", f"{title}: scaffold from {tpl}")
+        _git(work, "push", "-u", "origin", "main", timeout=300)
+        sha = _git(work, "rev-parse", "--short", "HEAD")
+
+        # 3) hosting site + Convex env (auth keys, site url, admin secret)
+        url = _ensure_firebase_site(site)
+        pem, jwks = _generate_auth_keys()
+        env = {"JWT_PRIVATE_KEY": pem, "JWKS": jwks, "SITE_URL": url, "ADMIN_SECRET": uuid.uuid4().hex}
+        resend = _cfg("RESEND_API_KEY")
+        if resend:
+            env["RESEND_API_KEY"] = resend
+        _store_secret(_convex_env_secret(slug), json.dumps(env))
+
+        # 4) registry row (no Convex key yet)
+        vals = dict(title=title, repo=repo, branch="main", build_dir="dist", convex_secret=None,
+                    firebase_site=site, url=url, updated_at=_now())
+        with persistence.sync_engine().begin() as c:
+            if _app(slug):
+                c.execute(update(persistence.apps).where(persistence.apps.c.slug == slug).values(**vals))
+            else:
+                c.execute(insert(persistence.apps).values(slug=slug, status="registered", created_at=_now(), **vals))
+        missing = "" if resend else " RESEND_API_KEY is not set — add it with set_convex_env before deploying or emails will not send."
+        return (f"scaffolded {repo} @ {sha} ({n} files templated) → site {url}\n"
+                f"Convex env prepared: JWT_PRIVATE_KEY, JWKS, SITE_URL, ADMIN_SECRET{', RESEND_API_KEY' if resend else ''}.\n"
+                f"NEXT: ask the owner for a Convex *production* deploy key (Convex dashboard → new project '{slug}' → "
+                f"Production → Settings → Deploy Keys), then register_app('{slug}', '{title}', '{repo}', "
+                f"convex_deploy_key=<key>) and deploy_app('{slug}').{missing}")
+    except Exception as e:  # noqa: BLE001
+        return f"error: {str(e).replace(tok, '***')}"
+
+
+@tool
+def set_convex_env(slug: str, name: str, value: str) -> str:
+    """Set (or clear with value='') a Convex production environment variable for a registered app — API keys,
+    SITE_URL, EMAIL_FROM, etc. Requires approval. Values are stored in Secret Manager and applied on the next
+    deploy_app (Cloud Build runs `convex env set` before deploying). Never echo secret values back."""
+    slug = slug.strip().lower()
+    name = name.strip()
+    if not _app(slug):
+        return f"error: no app '{slug}'"
+    if not re.match(r"^[A-Z][A-Z0-9_]*$", name):
+        return "rejected: name must be UPPER_SNAKE_CASE"
+    try:
+        env = _convex_env(slug)
+        if value == "":
+            env.pop(name, None)
+        else:
+            env[name] = value
+        _store_secret(_convex_env_secret(slug), json.dumps(env))
+        return f"{slug}: {name} {'cleared' if value == '' else 'set'} ({len(env)} vars staged: {', '.join(sorted(env))}). Applied on next deploy_app."
+    except Exception as e:  # noqa: BLE001
+        return f"error: {e}"
+
+
+@tool
+def list_convex_env(slug: str) -> str:
+    """List the NAMES of Convex env vars staged for an app (values are never shown)."""
+    env = _convex_env(slug.strip().lower())
+    return ", ".join(sorted(env)) if env else "(none)"
+
+
 TOOLS = [repo_open, repo_list, repo_read, repo_search, repo_write, repo_edit, repo_git,
          repo_commit_push, github_create_repo, repo_run,
+         scaffold_app, set_convex_env, list_convex_env,
          register_app, deploy_app, deploy_self, app_status, build_log, list_apps, add_custom_domain, delete_app]
-for _t in (repo_open, repo_list, repo_read, repo_search, repo_write, repo_edit, repo_git, app_status, build_log, list_apps):
+for _t in (repo_open, repo_list, repo_read, repo_search, repo_write, repo_edit, repo_git, app_status, build_log, list_apps,
+           list_convex_env):
     _t.metadata = {"requires_approval": False}
-for _t in (repo_commit_push, github_create_repo, repo_run, register_app, deploy_app, deploy_self, add_custom_domain, delete_app):
+for _t in (repo_commit_push, github_create_repo, repo_run, scaffold_app, set_convex_env, register_app, deploy_app,
+           deploy_self, add_custom_domain, delete_app):
     _t.metadata = {"requires_approval": True}
