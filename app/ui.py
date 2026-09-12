@@ -133,21 +133,103 @@ async def on_settings(s: dict) -> None:
 
 
 # ---------------------------------------------------------------- approval gate
-async def ask_approval(tool_calls: list[dict]) -> bool:
+# Approvals used to go through cl.AskActionMessage, which waits on a socket.io ack tied to
+# the *current* socket id. Any reconnect (phone sleeps, network blip, Cloud Run revision roll,
+# 1-hour request timeout) makes Chainlit emit `clear_ask` -> the buttons vanish, the composer
+# stays locked and the turn hangs until the 15-minute timeout, then counts as a rejection.
+# Now: a normal message with Approve/Reject actions (survives reconnects), resolved by either
+# a button click or a typed/spoken reply ("approve", "yes", "go ahead", "reject", "no").
+APPROVAL_TIMEOUT = 900
+_pending_approvals: dict[str, asyncio.Future] = {}
+_approval_msgs: dict[str, cl.Message] = {}
+
+_APPROVE_WORDS = r"(approve[d]?|approval|yes|yep|yeah|ok(ay)?|go( ahead)?|do it|proceed|confirm(ed)?|sure|please|y|👍|✅)"
+_REJECT_WORDS = r"(reject(ed)?|no|nope|cancel|stop|don'?t|deny|denied|decline[d]?|n|👎|❌)"
+APPROVE_RE = re.compile(rf"^(\W*{_APPROVE_WORDS})+\W*$", re.I)
+REJECT_RE = re.compile(rf"^(\W*{_REJECT_WORDS})+\W*$", re.I)
+
+
+def approval_intent(text: str) -> bool | None:
+    """True = approve, False = reject, None = not an approval reply."""
+    t = (text or "").strip()
+    if len(t) > 40:
+        return None
+    if APPROVE_RE.match(t):
+        return True
+    if REJECT_RE.match(t):
+        return False
+    return None
+
+
+def _approval_text(tool_calls: list[dict]) -> str:
     lines = ["**Nikki wants to run an action that needs your approval:**", ""]
     for tc in tool_calls:
         args = tc.get("args") or {}
         preview = "\n".join(f"  - `{k}`: {str(v)[:400]}" for k, v in args.items()) or "  (no arguments)"
         lines.append(f"- **{tc['name']}**\n{preview}")
-    res = await cl.AskActionMessage(
-        content="\n".join(lines),
+    lines += ["", "_Tap a button, or just reply **approve** / **reject**._"]
+    return "\n".join(lines)
+
+
+def resolve_approval(thread_id: str, approved: bool) -> bool:
+    """Settle a pending approval for this thread. Returns False if none was pending."""
+    fut = _pending_approvals.get(thread_id)
+    if not fut or fut.done():
+        return False
+    fut.set_result(approved)
+    return True
+
+
+async def _finish_approval_msg(thread_id: str, verdict: str) -> None:
+    msg = _approval_msgs.pop(thread_id, None)
+    if not msg:
+        return
+    try:
+        await msg.remove_actions()
+        msg.content = msg.content.split("\n\n_Tap a button")[0] + f"\n\n{verdict}"
+        await msg.update()
+    except Exception:  # noqa: BLE001
+        log.debug("could not update approval message", exc_info=True)
+
+
+async def ask_approval(thread_id: str, tool_calls: list[dict]) -> bool | None:
+    """True/False from the user; None when nobody answered within APPROVAL_TIMEOUT."""
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+    _pending_approvals[thread_id] = fut
+    msg = cl.Message(
+        content=_approval_text(tool_calls),
         actions=[
-            cl.Action(name="approve", payload={"v": "approve"}, label="✅ Approve"),
-            cl.Action(name="reject", payload={"v": "reject"}, label="❌ Reject"),
+            cl.Action(name="approve", payload={"thread_id": thread_id}, label="✅ Approve"),
+            cl.Action(name="reject", payload={"thread_id": thread_id}, label="❌ Reject"),
         ],
-        timeout=900,
-    ).send()
-    return bool(res and res.get("payload", {}).get("v") == "approve")
+    )
+    _approval_msgs[thread_id] = msg
+    await msg.send()
+    try:
+        approved = await asyncio.wait_for(fut, timeout=APPROVAL_TIMEOUT)
+    except asyncio.TimeoutError:
+        approved = None
+        await _finish_approval_msg(thread_id, "⌛ No answer in 15 minutes — treated as **rejected**. Ask again when you're ready.")
+    else:
+        await _finish_approval_msg(thread_id, "✅ **Approved**" if approved else "❌ **Rejected**")
+    finally:
+        _pending_approvals.pop(thread_id, None)
+    return approved
+
+
+@cl.action_callback("approve")
+async def _on_approve(action: cl.Action) -> None:
+    tid = (action.payload or {}).get("thread_id") or cl.context.session.thread_id
+    if not resolve_approval(tid, True):
+        await cl.Message(content="That approval is no longer pending.").send()
+
+
+@cl.action_callback("reject")
+async def _on_reject(action: cl.Action) -> None:
+    tid = (action.payload or {}).get("thread_id") or cl.context.session.thread_id
+    if not resolve_approval(tid, False):
+        await cl.Message(content="That approval is no longer pending.").send()
 
 
 # ---------------------------------------------------------------- streaming
@@ -269,18 +351,21 @@ _turn_locks: dict[str, asyncio.Lock] = {}
 async def on_message(message: cl.Message) -> None:
     set_principal(_principal())
     thread_id = cl.context.session.thread_id
+    intent = approval_intent(message.content) if not message.elements else None
+    if intent is not None and resolve_approval(thread_id, intent):
+        return  # typed/spoken answer to the pending approval
     lock = _turn_locks.setdefault(thread_id, asyncio.Lock())
     if lock.locked():
         # Two turns on one thread would interleave checkpoints and corrupt the history.
         await cl.Message(content="⏳ I'm still working on your previous message — please wait for it to finish (or approve/reject the pending action) and send that again.").send()
         return
     async with lock:
-        await _run_turn(message, thread_id)
+        await _run_turn(message, thread_id, intent)
     if not lock.locked():
         _turn_locks.pop(thread_id, None)
 
 
-async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "TurnRenderer", thread_id: str) -> None:
+async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "TurnRenderer", thread_id: str, preapproved: bool | None = None) -> None:
     """Run one turn to completion, pausing for approvals on gated tools."""
     while True:
         await stream_segment(graph, config, inp, r)
@@ -291,7 +376,17 @@ async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "Tu
         calls = pending_tool_calls(state)
         gated = [tc for tc in calls if registry.requires_approval(tc["name"], tc.get("args"))]
         if gated:
-            approved = await ask_approval(gated)
+            if preapproved is None:
+                approved = await ask_approval(thread_id, gated)
+                if approved is None:
+                    # Timed out. Another server instance may already have settled these calls
+                    # (typed approval after a reconnect) — never double-write the checkpoint.
+                    still = {tc["id"] for tc in pending_tool_calls(await graph.aget_state(config))}
+                    if still != {tc["id"] for tc in calls}:
+                        break
+                    approved = False
+            else:
+                approved, preapproved = preapproved, None
             await persistence.trace(thread_id, "approval", {"approved": approved, "tools": [tc["name"] for tc in gated]})
             if not approved:
                 for tc in calls:
@@ -324,7 +419,7 @@ async def attach_files(rels: list[str]) -> None:
         await cl.Message(content="", elements=elements).send()
 
 
-async def _run_turn(message: cl.Message, thread_id: str) -> None:
+async def _run_turn(message: cl.Message, thread_id: str, intent: bool | None = None) -> None:
     model = cl.user_session.get("model") or settings.model
     await persistence.trace(thread_id, "user", {"text": message.content, "model": model})
     r = TurnRenderer(thread_id)
@@ -342,11 +437,23 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
             # A previous turn may have been abandoned mid-approval; settle its pending
             # tool calls as rejected so the chat history stays valid for the provider.
             stale = pending_tool_calls(await graph.aget_state(config))
-            if stale:
-                await graph.aupdate_state(config, {"messages": rejection_messages(stale, "Superseded by a new user message.")}, as_node="tools")
+            preapproved: bool | None = None
             inp: Any = {"messages": [HumanMessage(content=user_content)]}
+            if stale and intent is not None:
+                # The approval prompt was lost (page reload, new server instance, restart) but the
+                # paused tool calls are still in the checkpoint: a typed approve/reject answers them.
+                names = ", ".join(tc["name"] for tc in stale)
+                if intent:
+                    preapproved, inp = True, None
+                    await cl.Message(content=f"✅ Approved — running **{names}**.").send()
+                else:
+                    await graph.aupdate_state(config, {"messages": rejection_messages(stale)}, as_node="tools")
+                    inp = None
+                    await cl.Message(content=f"❌ Rejected **{names}**.").send()
+            elif stale:
+                await graph.aupdate_state(config, {"messages": rejection_messages(stale, "Superseded by a new user message.")}, as_node="tools")
             try:
-                await _drive(graph, cp, model, config, inp, r, thread_id)
+                await _drive(graph, cp, model, config, inp, r, thread_id, preapproved)
             except Exception as e:  # noqa: BLE001
                 fb = fallback_model_for(model)
                 if not (fb and is_billing_error(e)):
