@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from app import persistence
 from app.auth import router as auth_router
+from app.canvas import router as canvas_router
 from app.integrations.routes import router as integrations_router
 from app.legal import router as legal_router
 from app.scheduler import router as scheduler_router
@@ -66,6 +67,7 @@ async def skills() -> list[dict]:
 
 app.include_router(spaces_router)
 app.include_router(auth_router)
+app.include_router(canvas_router, prefix="/canvas")
 app.include_router(integrations_router)
 app.include_router(scheduler_router)
 app.include_router(legal_router)

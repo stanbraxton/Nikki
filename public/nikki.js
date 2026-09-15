@@ -44,6 +44,7 @@
     }
     bar.appendChild(linkEl('/admin', 'Admin'));
     bar.appendChild(linkEl('/spaces', 'Spaces'));
+    bar.appendChild(linkEl('/canvas', 'Canvas'));
   }
 
   // ============ VOICE CONTROLS ============

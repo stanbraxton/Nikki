@@ -1,6 +1,7 @@
 chainlit>=2.6
 fastapi
 uvicorn[standard]
+websockets
 langgraph>=0.6
 langchain-core
 langchain-anthropic
