@@ -75,5 +75,12 @@ custom_js = "/public/nikki.js"
     url = "/schedules"
     target = "_self"
 
+[[UI.header_links]]
+    name = "Canvas"
+    display_name = "Canvas"
+    icon_url = "https://fonts.gstatic.com/s/i/short-term/release/materialsymbolsoutlined/dashboard/default/24px.svg"
+    url = "/canvas"
+    target = "_self"
+
 [meta]
 generated_by = "2.12.0"
