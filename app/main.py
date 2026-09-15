@@ -67,7 +67,7 @@ async def skills() -> list[dict]:
 
 app.include_router(spaces_router)
 app.include_router(auth_router)
-app.include_router(canvas_router, prefix="/canvas")
+app.include_router(canvas_router)
 app.include_router(integrations_router)
 app.include_router(scheduler_router)
 app.include_router(legal_router)

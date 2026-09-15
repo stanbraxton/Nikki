@@ -27,7 +27,7 @@ from app import persistence
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/canvas", tags=["canvas"])
+router = APIRouter(prefix="/canvas", tags=["canvas"])
 
 _client: AsyncOpenAI | None = None
 
@@ -493,7 +493,7 @@ async function startSession() {
     
     // Connect WebSocket
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${protocol}//${location.host}/api/canvas/session`);
+    ws = new WebSocket(`${protocol}//${location.host}/canvas/session`);
     
     ws.onopen = async () => {
       setStatus('Connected', 'connected');
