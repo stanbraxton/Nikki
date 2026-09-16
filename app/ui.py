@@ -264,7 +264,8 @@ class TurnRenderer:
         if self.msg is not None:
             if self.msg.content.strip():
                 self.final_text.append(self.msg.content)
-                await self.msg.update()
+                # Finalize the streaming message before any approval prompt
+                await self.msg.send()
             else:
                 await self.msg.remove()
             self.msg = None
