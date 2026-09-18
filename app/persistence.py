@@ -3,14 +3,15 @@ the Chainlit data layer (chat history shown in the sidebar). Postgres in product
 SQLite for local development."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import asyncio
+import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator
 
-from sqlalchemy import Column, DateTime, Integer, MetaData, String, Table, Text, inspect, insert, text
+from sqlalchemy import Column, DateTime, Index, Integer, MetaData, String, Table, Text, and_, inspect, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from app.config import ROOT, settings
@@ -187,6 +188,33 @@ token_usage = Table(  # track LLM token consumption per conversation turn
     Column("total_tokens", Integer, nullable=False, default=0),
 )
 
+# An approval is a durable authorization for exactly one paused graph checkpoint.
+# It binds the decision to the signed-in user and lets the database—not a Cloud Run
+# instance's memory—decide which click/reply, if any, may resume that checkpoint.
+approvals = Table(
+    "approvals",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column("thread_id", String(64), index=True, nullable=False),
+    Column("tenant_id", String(64), index=True, nullable=False),
+    Column("email", String(200), nullable=False),
+    Column("tool_names", Text, nullable=False, default="[]"),
+    Column("status", String(32), index=True, nullable=False),  # pending | approved_running | rejected_running | completed | expired | superseded | failed
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("claimed_at", DateTime(timezone=True)),
+    Column("completed_at", DateTime(timezone=True)),
+)
+Index(
+    "ix_approvals_one_pending_thread",
+    approvals.c.thread_id,
+    unique=True,
+    # Keep at most one unclaimed authorization per conversation across every
+    # Cloud Run instance. Terminal rows remain available for audit/debugging.
+    postgresql_where=text("status = 'pending'"),
+    sqlite_where=text("status = 'pending'"),
+)
+
 _engine: AsyncEngine | None = None
 _sync_engine = None
 _checkpoint_pool = None
@@ -269,6 +297,7 @@ async def init_db() -> None:
         for stmt in schema_file.read_text().split(";"):
             if stmt.strip():
                 await conn.execute(text(stmt))
+    await expire_pending_approvals()
     log.info("database ready (%s)", "postgres" if settings.is_postgres else "sqlite")
 
 
@@ -318,9 +347,210 @@ def _tenant_or_admin() -> str:
     return p.tenant_id if p else "admin"
 
 
-async def trace(thread_id: str, kind: str, payload: Any) -> None:
-    import uuid
+def _approval_now() -> datetime:
+    return datetime.now(timezone.utc)
 
+
+async def expire_pending_approvals() -> None:
+    """Durably expire unanswered approvals without touching their graph checkpoint.
+
+    The next non-approval message safely supersedes the still-paused graph state,
+    rather than allowing an old financial/write action to run after its approval
+    window has elapsed.
+    """
+    now = _approval_now()
+    async with engine().begin() as conn:
+        await conn.execute(
+            update(approvals)
+            .where(and_(approvals.c.status == "pending", approvals.c.expires_at <= now))
+            .values(status="expired", completed_at=now)
+        )
+
+
+async def create_pending_approval(thread_id: str, tenant_id: str, email: str, tool_names: list[str],
+                                  ttl: timedelta = timedelta(minutes=15)) -> str:
+    """Create the one durable approval record for a paused graph checkpoint."""
+    now = _approval_now()
+    approval_id = str(uuid.uuid4())
+    async with engine().begin() as conn:
+        # The partial unique index below makes this close/reopen atomic across
+        # instances. Retiring a previous pending approval preserves the audit
+        # trail but leaves it impossible to claim.
+        await conn.execute(update(approvals).where(and_(
+            approvals.c.thread_id == thread_id, approvals.c.status == "pending"
+        )).values(status="superseded", completed_at=now))
+        await conn.execute(
+            insert(approvals).values(
+                id=approval_id,
+                thread_id=thread_id,
+                tenant_id=tenant_id,
+                email=email.lower(),
+                tool_names=json.dumps(tool_names),
+                status="pending",
+                created_at=now,
+                expires_at=now + ttl,
+            )
+        )
+    return approval_id
+
+
+async def claim_pending_approval(thread_id: str, tenant_id: str, email: str, approved: bool,
+                                 approval_id: str | None = None) -> tuple[str | None, str]:
+    """Atomically claim a pending approval before any graph/tool work starts.
+
+    Compare-and-set status transition is the cross-instance exactly-once barrier:
+    duplicate action events, typed replies, or a second Cloud Run instance can only
+    make one ``pending`` row become ``*_running``. A claimed approval is never
+    automatically retried because an external tool could already have run.
+    """
+    now = _approval_now()
+    email = email.lower()
+    async with engine().begin() as conn:
+        if approval_id is None:
+            row = (
+                await conn.execute(
+                    select(approvals.c.id)
+                    .where(
+                        and_(
+                            approvals.c.thread_id == thread_id,
+                            approvals.c.tenant_id == tenant_id,
+                            approvals.c.email == email,
+                            approvals.c.status == "pending",
+                        )
+                    )
+                    .order_by(approvals.c.created_at.desc())
+                    .limit(1)
+                )
+            ).first()
+            if not row:
+                return None, "no_pending"
+            approval_id = row.id
+
+        result = await conn.execute(
+            update(approvals)
+            .where(
+                and_(
+                    approvals.c.id == approval_id,
+                    approvals.c.thread_id == thread_id,
+                    approvals.c.tenant_id == tenant_id,
+                    approvals.c.email == email,
+                    approvals.c.status == "pending",
+                    approvals.c.expires_at > now,
+                )
+            )
+            .values(
+                status="approved_running" if approved else "rejected_running",
+                claimed_at=now,
+            )
+        )
+        if result.rowcount:
+            return approval_id, "claimed"
+
+        # Return a deliberately generic result to callers unless the record belongs
+        # to this user. This avoids disclosing another tenant's thread or approval.
+        row = (await conn.execute(select(approvals).where(approvals.c.id == approval_id))).first()
+        if not row:
+            return None, "no_pending"
+        record = row._mapping
+        if record["thread_id"] != thread_id or record["tenant_id"] != tenant_id or record["email"] != email:
+            return None, "not_owner"
+        if record["status"] == "pending":
+            expired = await conn.execute(
+                update(approvals)
+                .where(
+                    and_(
+                        approvals.c.id == approval_id,
+                        approvals.c.status == "pending",
+                        approvals.c.expires_at <= now,
+                    )
+                )
+                .values(status="expired", completed_at=now)
+            )
+            if expired.rowcount:
+                return approval_id, "expired"
+        return approval_id, record["status"]
+
+
+async def supersede_pending_approval(thread_id: str, tenant_id: str, email: str) -> str:
+    """Cancel an unanswered approval when the owner sends a different message.
+
+    Never supersede an execution that another instance already claimed; that is a
+    safe stop rather than risking a conflicting graph update or double tool run.
+    """
+    now = _approval_now()
+    email = email.lower()
+    async with engine().begin() as conn:
+        await conn.execute(
+            update(approvals)
+            .where(
+                and_(
+                    approvals.c.thread_id == thread_id,
+                    approvals.c.tenant_id == tenant_id,
+                    approvals.c.email == email,
+                    approvals.c.status == "pending",
+                )
+            )
+            .values(status="superseded", completed_at=now)
+        )
+        active = (
+            await conn.execute(
+                select(approvals.c.status)
+                .where(
+                    and_(
+                        approvals.c.thread_id == thread_id,
+                        approvals.c.tenant_id == tenant_id,
+                        approvals.c.email == email,
+                        approvals.c.status.in_(("approved_running", "rejected_running")),
+                    )
+                )
+                .order_by(approvals.c.claimed_at.desc())
+                .limit(1)
+            )
+        ).first()
+    return "running" if active else "ok"
+
+
+async def finish_approval(approval_id: str, status: str = "completed") -> None:
+    """Record a terminal result after the claimed graph continuation returns."""
+    if status not in ("completed", "failed"):
+        raise ValueError("invalid terminal approval status")
+    now = _approval_now()
+    async with engine().begin() as conn:
+        await conn.execute(
+            update(approvals)
+            .where(
+                and_(
+                    approvals.c.id == approval_id,
+                    approvals.c.status.in_(("approved_running", "rejected_running")),
+                )
+            )
+            .values(status=status, completed_at=now)
+        )
+
+
+async def approval_tool_names(approval_id: str) -> list[str] | None:
+    """Return the exact tools authorized by an approval after it was claimed."""
+    async with engine().connect() as conn:
+        row = (
+            await conn.execute(
+                select(approvals.c.tool_names).where(
+                    and_(
+                        approvals.c.id == approval_id,
+                        approvals.c.status.in_(("approved_running", "rejected_running")),
+                    )
+                )
+            )
+        ).first()
+    if not row:
+        return None
+    try:
+        names = json.loads(row.tool_names)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return names if isinstance(names, list) and all(isinstance(name, str) for name in names) else None
+
+
+async def trace(thread_id: str, kind: str, payload: Any) -> None:
     try:
         async with engine().begin() as conn:
             await conn.execute(

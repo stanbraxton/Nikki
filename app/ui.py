@@ -16,7 +16,7 @@ from app.agent import build_graph, fallback_model_for, friendly_error, is_billin
 from app.tools.artifacts import FILE_MARK, marks_in
 from app.tools.images import IMAGE_MARK
 from app.config import settings
-from app.tenancy import Principal, set_principal
+from app.tenancy import Principal, reset_principal, set_principal
 from app.uploads import ingest_uploads
 from app.tools import registry
 
@@ -166,8 +166,8 @@ def _approval_text(tool_calls: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def _finish_approval_msg(thread_id: str, verdict: str) -> None:
-    msg = _approval_msgs.pop(thread_id, None)
+async def _finish_approval_msg(approval_id: str, verdict: str) -> None:
+    msg = _approval_msgs.pop(approval_id, None)
     if not msg:
         return
     try:
@@ -182,28 +182,60 @@ async def ask_approval(thread_id: str, tool_calls: list[dict]) -> None:
     """Render an approval checkpoint, then return so the normal composer is usable."""
     if thread_id in _pending_approvals:
         return
+    principal = _principal()
+    approval_id = await persistence.create_pending_approval(
+        thread_id,
+        principal.tenant_id,
+        principal.email,
+        [tc["name"] for tc in tool_calls],
+    )
     _pending_approvals.add(thread_id)
     msg = cl.Message(
         content=_approval_text(tool_calls),
         actions=[
-            cl.Action(name="approve", payload={"thread_id": thread_id}, label="✅ Approve"),
-            cl.Action(name="reject", payload={"thread_id": thread_id}, label="❌ Reject"),
+            cl.Action(name="approve", payload={"thread_id": thread_id, "approval_id": approval_id}, label="✅ Approve"),
+            cl.Action(name="reject", payload={"thread_id": thread_id, "approval_id": approval_id}, label="❌ Reject"),
         ],
     )
-    _approval_msgs[thread_id] = msg
+    _approval_msgs[approval_id] = msg
     await msg.send()
+
+
+def _action_target(action: cl.Action) -> tuple[str, str]:
+    """Accept an action only in the thread it was rendered for.
+
+    The durable approval record performs the principal check as well; this immediate
+    check rejects a copied or forged action payload before it reaches the graph.
+    """
+    payload = action.payload or {}
+    thread_id = str(payload.get("thread_id") or "")
+    approval_id = str(payload.get("approval_id") or "")
+    session_thread_id = str(getattr(cl.context.session, "thread_id", "") or "")
+    if not thread_id or not approval_id or (session_thread_id and session_thread_id != thread_id):
+        raise ValueError("approval action does not belong to this conversation")
+    return thread_id, approval_id
 
 
 @cl.action_callback("approve")
 async def _on_approve(action: cl.Action) -> None:
-    tid = (action.payload or {}).get("thread_id") or cl.context.session.thread_id
-    await _continue_approval(tid, True)
+    try:
+        tid, approval_id = _action_target(action)
+    except ValueError:
+        log.warning("rejected mismatched approval action")
+        await cl.Message(content="That approval button does not belong to this conversation.").send()
+        return
+    await _continue_approval(tid, True, approval_id)
 
 
 @cl.action_callback("reject")
 async def _on_reject(action: cl.Action) -> None:
-    tid = (action.payload or {}).get("thread_id") or cl.context.session.thread_id
-    await _continue_approval(tid, False)
+    try:
+        tid, approval_id = _action_target(action)
+    except ValueError:
+        log.warning("rejected mismatched rejection action")
+        await cl.Message(content="That approval button does not belong to this conversation.").send()
+        return
+    await _continue_approval(tid, False, approval_id)
 
 
 # ---------------------------------------------------------------- streaming
@@ -329,8 +361,8 @@ async def on_message(message: cl.Message) -> None:
     thread_id = cl.context.session.thread_id
     intent = approval_intent(message.content) if not message.elements else None
     if intent is not None:
-        if await _continue_approval(thread_id, intent):
-            return  # typed/spoken answer to an approval checkpoint
+        await _continue_approval(thread_id, intent)
+        return  # typed/spoken answer never becomes a new ordinary request
     lock = _turn_locks.setdefault(thread_id, asyncio.Lock())
     if lock.locked():
         # Two turns on one thread would interleave checkpoints and corrupt the history.
@@ -372,51 +404,79 @@ async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "Tu
         graph = build_graph(cp, model)
 
 
-async def _continue_approval(thread_id: str, approved: bool) -> bool:
+async def _continue_approval(thread_id: str, approved: bool, approval_id: str | None = None) -> bool:
     """Resume a paused tool checkpoint in a fresh Chainlit turn.
 
     This deliberately does not rely on in-memory state: a page reload, a Cloud Run
     revision, or a different instance may serve the user's button click/reply.
     """
+    principal = _principal()
+    principal_token = set_principal(principal)
     lock = _turn_locks.setdefault(thread_id, asyncio.Lock())
     if lock.locked():
+        reset_principal(principal_token)
         return False
-    async with lock:
-        model = cl.user_session.get("model") or settings.model
-        config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.recursion_limit}
-        r = TurnRenderer(thread_id)
-        try:
-            async with persistence.checkpointer() as cp:
-                graph = build_graph(cp, model)
-                calls = pending_tool_calls(await graph.aget_state(config))
-                gated = [tc for tc in calls if registry.requires_approval(tc["name"], tc.get("args"))]
-                if not gated:
-                    await cl.Message(content="That approval is no longer pending.").send()
-                    return False
-                _pending_approvals.discard(thread_id)
-                await _finish_approval_msg(thread_id, "✅ **Approved**" if approved else "❌ **Rejected**")
-                await persistence.trace(thread_id, "approval", {"approved": approved, "tools": [tc["name"] for tc in gated]})
-                if approved:
-                    await cl.Message(content=f"✅ Approved — running **{', '.join(tc['name'] for tc in gated)}**.").send()
-                    await _drive(graph, cp, model, config, None, r, thread_id, True)
-                else:
-                    for tc in calls:
-                        step = r.steps.pop(tc["id"], None)
-                        if step:
-                            step.output = "rejected by user"
-                            step.is_error = True
-                            await step.update()
-                    await graph.aupdate_state(config, {"messages": rejection_messages(calls)}, as_node="tools")
-                    await _drive(build_graph(cp, model), cp, model, config, None, r, thread_id)
-        except Exception as e:  # noqa: BLE001
-            log.exception("approval continuation failed")
-            await r.close_segment()
-            await cl.Message(content=friendly_error(e)).send()
-            await persistence.trace(thread_id, "error", {"error": repr(e)})
-            return False
-        finally:
-            if not lock.locked():
-                _turn_locks.pop(thread_id, None)
+    try:
+        async with lock:
+            model = cl.user_session.get("model") or settings.model
+            config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.recursion_limit}
+            r = TurnRenderer(thread_id)
+            try:
+                approval_id, claim = await persistence.claim_pending_approval(
+                    thread_id, principal.tenant_id, principal.email, approved, approval_id
+                )
+                if claim != "claimed":
+                    messages = {
+                        "no_pending": "There is no approval waiting in this conversation.",
+                        "expired": "That approval expired without running anything. Please send the request again if you still want it done.",
+                        "not_owner": "That approval is not available in this conversation.",
+                        "approved_running": "That approval is already being processed.",
+                        "rejected_running": "That rejection is already being processed.",
+                        "completed": "That approval has already been handled.",
+                        "superseded": "That approval was replaced by a newer message.",
+                        "failed": "That approval did not finish and was left safely blocked. Send a new request rather than retrying the old action.",
+                    }
+                    await cl.Message(content=messages.get(claim, "That approval is no longer pending.")).send()
+                    return True
+                async with persistence.checkpointer() as cp:
+                    graph = build_graph(cp, model)
+                    calls = pending_tool_calls(await graph.aget_state(config))
+                    gated = [tc for tc in calls if registry.requires_approval(tc["name"], tc.get("args"))]
+                    authorized_tools = await persistence.approval_tool_names(approval_id)
+                    if not gated or authorized_tools != [tc["name"] for tc in gated]:
+                        await persistence.finish_approval(approval_id, "failed")
+                        await cl.Message(
+                            content="That approval no longer matches the action that was shown, so nothing was run. Please send the request again."
+                        ).send()
+                        return True
+                    _pending_approvals.discard(thread_id)
+                    await _finish_approval_msg(approval_id, "✅ **Approved**" if approved else "❌ **Rejected**")
+                    await persistence.trace(thread_id, "approval", {"approved": approved, "tools": [tc["name"] for tc in gated]})
+                    if approved:
+                        await cl.Message(content=f"✅ Approved — running **{', '.join(tc['name'] for tc in gated)}**.").send()
+                        await _drive(graph, cp, model, config, None, r, thread_id, True)
+                    else:
+                        for tc in calls:
+                            step = r.steps.pop(tc["id"], None)
+                            if step:
+                                step.output = "rejected by user"
+                                step.is_error = True
+                                await step.update()
+                        await graph.aupdate_state(config, {"messages": rejection_messages(calls)}, as_node="tools")
+                        await _drive(build_graph(cp, model), cp, model, config, None, r, thread_id)
+                await persistence.finish_approval(approval_id)
+            except Exception as e:  # noqa: BLE001
+                log.exception("approval continuation failed")
+                if approval_id:
+                    await persistence.finish_approval(approval_id, "failed")
+                await r.close_segment()
+                await cl.Message(content=friendly_error(e)).send()
+                await persistence.trace(thread_id, "error", {"error": repr(e)})
+                return False
+    finally:
+        if not lock.locked():
+            _turn_locks.pop(thread_id, None)
+        reset_principal(principal_token)
     if r.input_tokens > 0 or r.output_tokens > 0:
         await persistence.log_token_usage(thread_id, model, r.input_tokens, r.output_tokens)
     return True
@@ -442,6 +502,7 @@ async def attach_files(rels: list[str]) -> None:
 
 async def _run_turn(message: cl.Message, thread_id: str) -> None:
     model = cl.user_session.get("model") or settings.model
+    principal = _principal()
     await persistence.trace(thread_id, "user", {"text": message.content, "model": model})
     r = TurnRenderer(thread_id)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.recursion_limit}
@@ -455,6 +516,15 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
     try:
         async with persistence.checkpointer() as cp:
             graph = build_graph(cp, model)
+            approval_state = await persistence.supersede_pending_approval(
+                thread_id, principal.tenant_id, principal.email
+            )
+            if approval_state == "running":
+                await cl.Message(
+                    content="⏳ Your previous approved action is already being processed. Please wait for it to finish before sending another request."
+                ).send()
+                return
+            _pending_approvals.discard(thread_id)
             stale = pending_tool_calls(await graph.aget_state(config))
             inp: Any = {"messages": [HumanMessage(content=user_content)]}
             if stale:
