@@ -24,7 +24,7 @@ _eng = None
 def _e():
     global _eng
     if _eng is None:
-        _eng = create_engine(settings.sqlalchemy_sync_url, pool_pre_ping=True, pool_size=2, max_overflow=2)
+        _eng = create_engine(settings.sqlalchemy_sync_url, **persistence.sync_engine_kwargs())
     return _eng
 
 

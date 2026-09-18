@@ -8,6 +8,7 @@ import re
 from langchain_core.tools import tool
 from sqlalchemy import create_engine, inspect, text
 
+from app import persistence
 from app.config import settings
 
 _engine = None
@@ -20,7 +21,7 @@ def _eng():
     global _engine
     if _engine is None:
         url = settings.tool_database_url or settings.sqlalchemy_sync_url
-        _engine = create_engine(url, pool_pre_ping=True, future=True)
+        _engine = create_engine(url, future=True, **persistence.sync_engine_kwargs())
     return _engine
 
 

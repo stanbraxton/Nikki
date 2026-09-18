@@ -350,63 +350,13 @@
     }
   }
 
-  // ============ APPROVAL BUTTON FIX ============
-  function ensureActionButtons() {
-    // Find all messages with actions that might not be rendering properly
-    var actionContainers = document.querySelectorAll('.step-actions, .message-actions');
-    actionContainers.forEach(function(container) {
-      if (!container || container.getAttribute('data-fixed')) return;
-      container.setAttribute('data-fixed', 'true');
-      
-      // Ensure the container is visible and interactive
-      container.style.display = 'flex';
-      container.style.gap = '8px';
-      container.style.marginTop = '12px';
-      container.style.pointerEvents = 'auto';
-      container.style.zIndex = '10';
-      
-      // Fix each button inside
-      var buttons = container.querySelectorAll('button');
-      buttons.forEach(function(btn) {
-        btn.style.pointerEvents = 'auto';
-        btn.style.cursor = 'pointer';
-        btn.style.opacity = '1';
-        btn.style.visibility = 'visible';
-        btn.style.display = 'inline-flex';
-        
-        // Ensure click events are working
-        if (!btn.getAttribute('data-click-fixed')) {
-          btn.setAttribute('data-click-fixed', 'true');
-          // Re-attach the click handler to ensure it fires
-          btn.addEventListener('click', function(e) {
-            e.stopPropagation();
-            e.preventDefault();
-            // Let the original handler fire
-          }, true);
-        }
-      });
-    });
-  }
-
   new MutationObserver(function () { 
     onLogin(); 
     adminLinks();
     initVoiceControls();
-    ensureActionButtons();
   }).observe(document.documentElement, { childList: true, subtree: true });
   
   onLogin(); 
   adminLinks();
   initVoiceControls();
-  ensureActionButtons();
-  
-  // Also run periodically for the first 10 seconds after page load
-  var fixAttempts = 0;
-  var fixInterval = setInterval(function() {
-    ensureActionButtons();
-    fixAttempts++;
-    if (fixAttempts >= 20) {
-      clearInterval(fixInterval);
-    }
-  }, 500);
 })();

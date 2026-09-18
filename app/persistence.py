@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import json
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, AsyncIterator
 
 from sqlalchemy import Column, DateTime, Integer, MetaData, String, Table, Text, inspect, insert, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -188,6 +189,37 @@ token_usage = Table(  # track LLM token consumption per conversation turn
 
 _engine: AsyncEngine | None = None
 _sync_engine = None
+_checkpoint_pool = None
+_checkpoint_setup_lock = None
+_checkpoint_ready = False
+_POOL_SIZE = 1
+_MAX_OVERFLOW = 0
+_POOL_TIMEOUT = 20
+
+
+def async_engine_kwargs() -> dict[str, Any]:
+    """Keep each Cloud Run instance within Cloud SQL's small connection budget."""
+    if not settings.is_postgres:
+        return {}
+    return {
+        "pool_size": _POOL_SIZE,
+        "max_overflow": _MAX_OVERFLOW,
+        "pool_timeout": _POOL_TIMEOUT,
+        "pool_recycle": 1800,
+    }
+
+
+def sync_engine_kwargs() -> dict[str, Any]:
+    """Settings shared by the few synchronous helper engines."""
+    if not settings.is_postgres:
+        return {}
+    return {
+        "pool_size": 1,
+        "max_overflow": 0,
+        "pool_timeout": _POOL_TIMEOUT,
+        "pool_recycle": 1800,
+        "pool_pre_ping": True,
+    }
 
 
 def sync_engine():
@@ -196,15 +228,35 @@ def sync_engine():
     if _sync_engine is None:
         from sqlalchemy import create_engine
 
-        _sync_engine = create_engine(settings.sqlalchemy_sync_url, pool_pre_ping=True, pool_size=2, max_overflow=2)
+        _sync_engine = create_engine(settings.sqlalchemy_sync_url, **sync_engine_kwargs())
     return _sync_engine
 
 
 def engine() -> AsyncEngine:
     global _engine
     if _engine is None:
-        _engine = create_async_engine(settings.sqlalchemy_async_url, pool_pre_ping=True)
+        _engine = create_async_engine(settings.sqlalchemy_async_url, **async_engine_kwargs())
     return _engine
+
+
+def chainlit_data_layer():
+    """Create Chainlit's data layer under the same small Cloud SQL budget."""
+    from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
+
+    # Chainlit 2.12 does not expose engine kwargs. Patch its imported factory
+    # only while the data layer is initialized, so its normal constructor builds
+    # the correct bounded engine/session pair from the outset.
+    from unittest.mock import patch
+    import chainlit.data.sql_alchemy as chainlit_sqlalchemy
+
+    real_create_async_engine = chainlit_sqlalchemy.create_async_engine
+
+    def bounded_create_async_engine(url: str, *args: Any, **kwargs: Any) -> AsyncEngine:
+        kwargs.update(async_engine_kwargs())
+        return real_create_async_engine(url, *args, **kwargs)
+
+    with patch.object(chainlit_sqlalchemy, "create_async_engine", bounded_create_async_engine):
+        return SQLAlchemyDataLayer(conninfo=settings.sqlalchemy_async_url)
 
 
 async def init_db() -> None:
@@ -218,6 +270,22 @@ async def init_db() -> None:
             if stmt.strip():
                 await conn.execute(text(stmt))
     log.info("database ready (%s)", "postgres" if settings.is_postgres else "sqlite")
+
+
+async def close_db() -> None:
+    """Close pooled database resources cleanly when a Cloud Run instance stops."""
+    global _engine, _sync_engine, _checkpoint_pool, _checkpoint_setup_lock, _checkpoint_ready
+    if _checkpoint_pool is not None:
+        await _checkpoint_pool.close()
+        _checkpoint_pool = None
+    _checkpoint_setup_lock = None
+    _checkpoint_ready = False
+    if _engine is not None:
+        await _engine.dispose()
+        _engine = None
+    if _sync_engine is not None:
+        _sync_engine.dispose()
+        _sync_engine = None
 
 
 def _migrate(conn) -> None:
@@ -292,14 +360,31 @@ async def log_token_usage(thread_id: str, model: str, input_tokens: int, output_
 
 
 @asynccontextmanager
-async def checkpointer():
+async def checkpointer() -> AsyncIterator[Any]:
     """Yield a LangGraph checkpointer bound to the configured database."""
     if settings.is_postgres:
+        global _checkpoint_pool, _checkpoint_setup_lock, _checkpoint_ready
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+        from psycopg.rows import dict_row
+        from psycopg_pool import AsyncConnectionPool
 
-        async with AsyncPostgresSaver.from_conn_string(settings.database_url) as saver:
-            await saver.setup()
-            yield saver
+        if _checkpoint_setup_lock is None:
+            _checkpoint_setup_lock = asyncio.Lock()
+        async with _checkpoint_setup_lock:
+            if _checkpoint_pool is None:
+                _checkpoint_pool = AsyncConnectionPool(
+                    conninfo=settings.database_url,
+                    min_size=0,
+                    max_size=1,
+                    kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+                    open=False,
+                )
+                await _checkpoint_pool.open()
+            if not _checkpoint_ready:
+                await AsyncPostgresSaver(_checkpoint_pool).setup()
+                _checkpoint_ready = True
+        saver = AsyncPostgresSaver(_checkpoint_pool)
+        yield saver
     else:
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 

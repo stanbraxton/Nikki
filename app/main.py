@@ -30,7 +30,10 @@ async def lifespan(_: FastAPI):
 
     await ensure_admin()
     log.info("tools loaded: %s", [t.name for t in registry.tools(admin=True)])
-    yield
+    try:
+        yield
+    finally:
+        await persistence.close_db()
 
 
 app = FastAPI(title="Nikki", version="0.5.0", lifespan=lifespan, docs_url=None, redoc_url=None)
