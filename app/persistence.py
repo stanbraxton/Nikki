@@ -368,7 +368,7 @@ async def expire_pending_approvals() -> None:
 
 
 async def create_pending_approval(thread_id: str, tenant_id: str, email: str, tool_names: list[str],
-                                  ttl: timedelta = timedelta(minutes=15)) -> str:
+                                  ttl: timedelta = timedelta(hours=5)) -> str:
     """Create the one durable approval record for a paused graph checkpoint."""
     now = _approval_now()
     approval_id = str(uuid.uuid4())
