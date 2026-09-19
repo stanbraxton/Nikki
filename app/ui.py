@@ -268,13 +268,10 @@ class TurnRenderer:
             await self.reasoning.update()
             self.reasoning = None
         if self.msg is not None:
-            if self.msg.content.strip():
-                self.final_text.append(self.msg.content)
-                # `send` finalizes a streamed message. `update` leaves the client turn
-                # in its active/Stop state when the next event is an approval checkpoint.
-                await self.msg.send()
-            else:
-                await self.msg.remove()
+            # Always send the message if it was created, even if content appears empty
+            # (the streaming may have populated it on the client side)
+            self.final_text.append(self.msg.content)
+            await self.msg.send()
             self.msg = None
 
     async def tool_planned(self, tc: dict) -> None:
