@@ -112,10 +112,10 @@ def read_pptx(p: Path) -> str:
 
 
 def describe_image(p: Path, question: str = "") -> str:
-    """Vision read of an image via OpenAI (Stan's key). Transcribes text exactly, then describes."""
-    if not settings.openai_api_key:
-        return "error: OPENAI_API_KEY is not configured, cannot look at images"
-    from openai import OpenAI
+    """Vision read of an image via Claude (Anthropic). Transcribes text exactly, then describes."""
+    if not settings.anthropic_api_key:
+        return "error: ANTHROPIC_API_KEY is not configured, cannot look at images"
+    from anthropic import Anthropic
 
     mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}.get(p.suffix.lower().lstrip("."), "image/png")
     b64 = base64.b64encode(p.read_bytes()).decode()
@@ -123,13 +123,16 @@ def describe_image(p: Path, question: str = "") -> str:
         "First transcribe ALL visible text, numbers, labels and table contents exactly as written, preserving layout "
         "(use a Markdown table for tabular data). Then describe what the image shows in 2-4 sentences."
     )
-    client = OpenAI(api_key=settings.openai_api_key)
-    r = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": [{"type": "text", "text": ask}, {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}]}],
-        max_tokens=1500,
+    client = Anthropic(api_key=settings.anthropic_api_key)
+    r = client.messages.create(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
+            {"type": "text", "text": ask}
+        ]}],
     )
-    return r.choices[0].message.content or "(no description)"
+    return r.content[0].text if r.content else "(no description)"
 
 
 def read_any(p: Path, question: str = "") -> str:
