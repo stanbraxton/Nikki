@@ -245,6 +245,7 @@ class TurnRenderer:
     def __init__(self, thread_id: str) -> None:
         self.thread_id = thread_id
         self.msg: cl.Message | None = None
+        self.msg_text: list[str] = []  # accumulate streamed tokens for persistence
         self.reasoning: cl.Step | None = None
         self.steps: dict[str, cl.Step] = {}
         self.final_text: list[str] = []
@@ -255,6 +256,7 @@ class TurnRenderer:
         if self.msg is None:
             self.msg = cl.Message(content="")
             await self.msg.send()
+        self.msg_text.append(text)
         await self.msg.stream_token(text)
 
     async def thinking(self, text: str) -> None:
@@ -268,11 +270,16 @@ class TurnRenderer:
             await self.reasoning.update()
             self.reasoning = None
         if self.msg is not None:
-            # Always send the message if it was created, even if content appears empty
-            # (the streaming may have populated it on the client side)
-            self.final_text.append(self.msg.content)
-            await self.msg.send()
+            # Update content from accumulated tokens before persisting
+            full_text = "".join(self.msg_text)
+            if full_text:
+                self.msg.content = full_text
+                self.final_text.append(full_text)
+                await self.msg.send()
+            else:
+                await self.msg.remove()
             self.msg = None
+            self.msg_text = []
 
     async def tool_planned(self, tc: dict) -> None:
         step = cl.Step(name=tc["name"], type="tool")
