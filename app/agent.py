@@ -22,9 +22,28 @@ from app.tools import registry
 log = logging.getLogger("nikki.agent")
 
 
+# Anthropic models that still take a fixed thinking budget. Everything else is
+# assumed to want adaptive thinking: new model IDs trend that way, so an unknown
+# name defaults to the supported path rather than the removed one.
+#
+# The split is not cosmetic. On Sonnet 5 / Opus 5 / Opus 4.7+ the API removed BOTH
+# `thinking.type: "enabled"` (with budget_tokens) and the sampling parameters, so
+# the old call failed twice over:
+#   400 "thinking.type.enabled" is not supported for this model.
+#       Use "thinking.type.adaptive" and "output_config.effort" ...
+# and `temperature: 1` is rejected on the same models for the same reason.
+_LEGACY_THINKING_PREFIXES = ("claude-haiku-4-5", "claude-sonnet-4-5", "claude-3")
+
+
+def uses_adaptive_thinking(name: str) -> bool:
+    """True when this model wants adaptive thinking + effort, not a token budget."""
+    return not name.startswith(_LEGACY_THINKING_PREFIXES)
+
+
 def make_model(spec: str | None = None) -> BaseChatModel:
     """`provider:model` -> chat model. Providers: anthropic, openai."""
-    provider, _, name = (spec or settings.model).partition(":")
+    resolved = spec or settings.model
+    provider, _, name = resolved.partition(":")
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
@@ -32,21 +51,38 @@ def make_model(spec: str | None = None) -> BaseChatModel:
                                   "api_key": settings.anthropic_api_key,
                                   "max_tokens": settings.max_tokens}
         budget = settings.thinking_budget_tokens
+        note = "thinking off"
         if budget > 0:
-            # Extended thinking needs max_tokens > budget, and temperature fixed at 1.
-            # The UI already renders thinking blocks (stream_segment handles
-            # content blocks of type "thinking"); the model just never emitted any.
-            # requirements.txt pins langchain-anthropic>=1.7.2,<2, where `thinking` is a
-            # real constructor field. There is deliberately no fallback here: on a build
-            # without that field pydantic does NOT raise, it shunts the kwarg into
-            # model_kwargs with a UserWarning, so any try/except around this is dead code.
-            kwargs.update({"max_tokens": max(settings.max_tokens, budget + 4096),
-                           "temperature": 1,
-                           "thinking": {"type": "enabled", "budget_tokens": budget}})
+            if uses_adaptive_thinking(name):
+                # `reasoning_effort` alone is the whole configuration: langchain maps it
+                # to output_config.effort AND, because `thinking` is left unset, defaults
+                # thinking to {"type": "adaptive", "display": "summarized"}.
+                #
+                # "summarized" is load-bearing, not incidental. The API default is
+                # "omitted", which returns thinking blocks whose text is EMPTY - and
+                # ui.py's stream_segment only renders a block when block["thinking"] is
+                # truthy. Setting `thinking` by hand here would buy a working request
+                # that renders nothing, which is indistinguishable from thinking being off.
+                #
+                # Deliberately NOT set on this path: `temperature` (rejected, 400) and the
+                # max_tokens bump (that headroom exists to fit a fixed budget, which
+                # adaptive thinking does not have).
+                kwargs["reasoning_effort"] = settings.thinking_effort
+                note = f"thinking adaptive, effort={settings.thinking_effort}"
+            else:
+                # Legacy path: a fixed budget needs max_tokens > budget and temperature 1.
+                kwargs.update({"max_tokens": max(settings.max_tokens, budget + 4096),
+                               "temperature": 1,
+                               "thinking": {"type": "enabled", "budget_tokens": budget}})
+                note = f"thinking budget={budget}"
+        # Logged because route_model() can silently change which model a turn uses.
+        # Without this line an unexplained bill has nothing to attribute it to.
+        log.info("model resolved: %s (%s, max_tokens=%s)", resolved, note, kwargs["max_tokens"])
         return ChatAnthropic(**kwargs)
     if provider == "openai":
         from langchain_openai import ChatOpenAI
 
+        log.info("model resolved: %s (thinking n/a, openai)", resolved)
         return ChatOpenAI(model=name, streaming=True, api_key=settings.openai_api_key)
     raise ValueError(f"unknown model provider: {provider!r} (use anthropic:<model> or openai:<model>)")
 
@@ -73,10 +109,17 @@ def route_model(user_text: str, recent_tools: set[str] | None = None) -> str | N
     """
     if not settings.engineer_model:
         return None
-    if recent_tools and (recent_tools & ENGINEER_TOOLS):
+    hit = recent_tools & ENGINEER_TOOLS if recent_tools else set()
+    if hit:
+        log.info("route_model -> %s (engineer tool used: %s)",
+                 settings.engineer_model, ", ".join(sorted(hit)))
         return settings.engineer_model
     t = (user_text or "").lower()
-    return settings.engineer_model if any(h in t for h in _ENGINEER_HINTS) else None
+    word = next((h for h in _ENGINEER_HINTS if h in t), None)
+    if word:
+        log.info("route_model -> %s (matched hint %r)", settings.engineer_model, word)
+        return settings.engineer_model
+    return None
 
 _BILLING_MARKERS = ("credit balance is too low", "insufficient_quota", "billing_hard_limit_reached", "exceeded your current quota")
 

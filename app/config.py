@@ -57,6 +57,12 @@ class Settings:
     # On by default: the largest single lever on answer quality in this app. The UI has always
     # rendered thinking blocks (stream_segment handles them); the model was never asked for any.
     thinking_budget_tokens: int = int(_env("NIKKI_THINKING_BUDGET_TOKENS", "4000"))
+    # Effort for models that use ADAPTIVE thinking (Sonnet 5, Opus 5, Opus 4.7+), which
+    # replaced the fixed budget above - those models reject budget_tokens with a 400.
+    # thinking_budget_tokens is still the on/off switch for both kinds; this sets depth
+    # for the adaptive kind. "high" is the API default, so "medium" is the cheaper knob.
+    # Valid: low | medium | high | xhigh | max.
+    thinking_effort: str = _env("NIKKI_THINKING_EFFORT", "medium") or "medium"
     # Model for turns that touch the engineer toolchain. Empty = no routing.
     # Deliberately the SAME model as `model` above for now, so routing is live and exercised
     # but costs nothing extra. Extended thinking and the sonnet-5 bump ship as one change and
