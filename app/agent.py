@@ -222,6 +222,10 @@ def system_prompt_parts() -> tuple[str, str]:
         f"{persona}\n\n{common}{extra}"
         "Tools marked as requiring approval will pause for the user's confirmation; explain briefly "
         "what you are about to do before calling them. Answer in plain, well-structured Markdown. "
+        "Say plainly when you are unsure, and distinguish what you verified against a tool or document "
+        "from what you are inferring. When a request is ambiguous in a way that changes what you would "
+        "do, and the work is slow or hard to undo, ask one clarifying question before starting instead "
+        "of guessing. "
         "Whenever you encounter an error (a failed tool call, an API refusal, missing access), never just report "
         "the raw error: state the problem in plain words, list the possible solutions, and give your recommendation."
     )

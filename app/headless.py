@@ -9,7 +9,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage
 
 from app import persistence
-from app.agent import build_graph, fallback_model_for, is_billing_error, pending_tool_calls, rejection_messages, text_of
+from app.agent import build_graph, fallback_model_for, is_billing_error, pending_tool_calls, rejection_messages, route_model, text_of
 from app.config import settings
 from app.guards import TurnBudget, UsageMeter
 from app.tools import registry
@@ -18,6 +18,10 @@ log = logging.getLogger("nikki.headless")
 
 
 async def run_prompt(prompt: str, thread_id: str, auto_approve: bool = False, model: str | None = None) -> str:
+    # Scheduled and API runs get the same engineering-model routing as the chat UI. An explicit
+    # `model` from the caller always wins; routing only fills in the default.
+    if model is None:
+        model = route_model(prompt)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.recursion_limit}
     # The same per-turn budget the interactive path uses. This loop is the one nobody
     # is watching -- and a schedule created through the approval gate may carry

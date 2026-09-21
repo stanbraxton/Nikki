@@ -69,6 +69,9 @@ async def watch_space(slug: str) -> None:
     await card.update()
 
 MODEL_CHOICES = [
+    "anthropic:claude-opus-5",
+    "anthropic:claude-sonnet-5",
+    "anthropic:claude-haiku-4-5-20251001",
     "anthropic:claude-sonnet-4-5",
     "anthropic:claude-opus-4-1",
     "anthropic:claude-haiku-4-5",
@@ -321,6 +324,11 @@ class TurnRenderer:
         await step.send()
         self.steps[tc["id"]] = step
         await persistence.trace(self.thread_id, "tool_call", tc)
+        # Remembered so route_model can upgrade a later turn on this thread that started as
+        # ordinary conversation and drifted into engineering work.
+        seen = cl.user_session.get("recent_tools") or set()
+        seen.add(tc["name"])
+        cl.user_session.set("recent_tools", seen)
 
     async def show_image(self, out: str) -> None:
         """Render an image a tool saved in the workspace inline in the chat."""
@@ -590,7 +598,7 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
 
     # Route engineering turns to a stronger model, unless the user picked one
     # explicitly in the chat settings panel (an explicit choice always wins).
-    routed = route_model(message.content)
+    routed = route_model(message.content, cl.user_session.get("recent_tools"))
     if routed and (cl.user_session.get("model") or settings.model) == settings.model:
         model = routed
         await persistence.trace(thread_id, "model_routed", {"to": routed})

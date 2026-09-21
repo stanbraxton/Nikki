@@ -22,20 +22,27 @@ def _env(name: str, default: str | None = None) -> str | None:
 class Settings:
     app_name: str = "Nikki"
     # LLM
-    model: str = _env("NIKKI_MODEL", "anthropic:claude-sonnet-4-5")
+    model: str = _env("NIKKI_MODEL", "anthropic:claude-sonnet-5")
     anthropic_api_key: str | None = _env("ANTHROPIC_API_KEY")
     openai_api_key: str | None = _env("OPENAI_API_KEY")
     # Used automatically when the primary provider rejects a call for billing reasons
     # (e.g. Anthropic "credit balance is too low"). Empty string disables the fallback.
-    fallback_model: str | None = _env("NIKKI_FALLBACK_MODEL", "openai:gpt-4.1-mini")
+    # This MUST stay on a different provider than `model`: an Anthropic fallback would share
+    # the exhausted account and fail identically. gpt-4.1 rather than gpt-4.1-mini, so a paying
+    # subscriber who lands here still gets a usable answer rather than a visible downgrade.
+    fallback_model: str | None = _env("NIKKI_FALLBACK_MODEL", "openai:gpt-4.1")
     # Approx. token budget for conversation history sent to the model (system prompt excluded).
     # The small default protects the OpenAI fallback (30k TPM org cap); Anthropic models get a much
     # larger window so long debugging threads keep their earlier errors and findings.
     history_budget_tokens: int = int(_env("NIKKI_HISTORY_BUDGET_TOKENS", "24000"))
     history_budget_tokens_anthropic: int = int(_env("NIKKI_HISTORY_BUDGET_TOKENS_ANTHROPIC", "80000"))
-    # tool results from earlier turns are shortened to this many chars before being re-sent (0 = off)
-    old_tool_result_chars: int = int(_env("NIKKI_OLD_TOOL_RESULT_CHARS", "1500"))
-    max_tokens: int = int(_env("NIKKI_MAX_TOKENS", "4096"))
+    # Tool results from earlier turns are shortened to this many chars before being re-sent (0 = off).
+    # Raised from 1500: compaction rewrites messages that were part of the PREVIOUS turn's cached
+    # prefix, so an aggressive limit both strips the evidence a follow-up question needs and
+    # invalidates the Anthropic prompt cache from that point on - paying full price for less
+    # context. trim_history runs first, so this only ever shrinks a history already inside budget.
+    old_tool_result_chars: int = int(_env("NIKKI_OLD_TOOL_RESULT_CHARS", "6000"))
+    max_tokens: int = int(_env("NIKKI_MAX_TOKENS", "8192"))
     # Graph-level step cap. Was 40 - higher than LangGraph's own default of 25,
     # so a looping turn ran nearly twice as long before anything stopped it.
     recursion_limit: int = int(_env("NIKKI_RECURSION_LIMIT", "18"))
@@ -47,9 +54,13 @@ class Settings:
     # Hard ceiling on input+output tokens for one turn. 0 disables.
     turn_token_ceiling: int = int(_env("NIKKI_TURN_TOKEN_CEILING", "400000"))
     # Extended thinking budget, Anthropic only. 0 = off. Raises max_tokens when set.
-    thinking_budget_tokens: int = int(_env("NIKKI_THINKING_BUDGET_TOKENS", "0"))
+    # On by default: the largest single lever on answer quality in this app. The UI has always
+    # rendered thinking blocks (stream_segment handles them); the model was never asked for any.
+    thinking_budget_tokens: int = int(_env("NIKKI_THINKING_BUDGET_TOKENS", "4000"))
     # Model for turns that touch the engineer toolchain. Empty = no routing.
-    engineer_model: str = _env("NIKKI_ENGINEER_MODEL", "") or ""
+    # An Opus-class model for engineering turns confines the cost increase to the turns that
+    # need the reasoning; ordinary conversation stays on the cheaper default above.
+    engineer_model: str = _env("NIKKI_ENGINEER_MODEL", "anthropic:claude-opus-5") or ""
     # Persistence. Postgres in prod (postgresql://user:pw@/db?host=/cloudsql/...),
     # SQLite locally.
     database_url: str = _env("DATABASE_URL", f"sqlite:///{ROOT / 'data' / 'nikki.db'}")
@@ -67,15 +78,15 @@ class Settings:
     persona: str = field(default_factory=lambda: _env(
         "NIKKI_PERSONA",
         "You are Nikki, Stan Braxton's private AI assistant. You are direct, concise, "
-        "and practical. You reason step by step, use tools when they help, and never "
+        "and practical. You use tools when they help, and never "
         "pretend to have done something you did not do. Any action with side effects "
         "must go through an approval gate; if the user declines, respect it.",
     ))
 
     tenant_persona: str = field(default_factory=lambda: _env(
         "NIKKI_TENANT_PERSONA",
-        "You are Nikki, the user's private AI assistant. You are direct, concise, and practical. You reason "
-        "step by step, use tools when they help, and never pretend to have done something you did not do. "
+        "You are Nikki, the user's private AI assistant. You are direct, concise, and practical. You use "
+        "tools when they help, and never pretend to have done something you did not do. "
         "Any action with side effects must go through an approval gate; if the user declines, respect it. "
         "You only ever see this user's own data; never reference other users.",
     ))
