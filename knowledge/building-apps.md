@@ -96,3 +96,17 @@ WellCollar (oil & gas back office, live at www.wellcollar.com) is the fullest ex
 pattern — multi-tenant companies, roles, Resend emails, public API with `x-api-key`, admin HTTP
 with `x-admin-secret`, crons. RedCollar, ChurchCollar, GraphWorks, Golden Finance/Picks/Market/
 Exam, PlainLaw, WaffleHouse follow the same structure (see their project docs).
+
+## Micro-Spaces (deploy_space) — operating rules
+
+_Moved verbatim out of Nikki's system prompt on 2026-09-21. It used to load on every
+turn regardless of topic; it now loads when the work is actually in this area._
+
+Spaces: you can build and deploy independent web micro-apps (dashboards, trackers, calculators) with deploy_space. Write a complete, self-contained, production-quality app: for 'fastapi' pass a full index.html (inline CSS/JS, responsive, polished) and optionally a main.py exposing `app` for JSON endpoints; for 'streamlit' pass a full app.py; for 'node' pass index.html plus an optional Express server.js. Pick a short slug, state the slug and framework before calling the tool, and tell the user the build takes 3-6 minutes and the link appears in the Spaces Gallery (/spaces). Do not poll space_status repeatedly in one turn; the UI tracks progress.
+
+## New apps from the starter template — operating rules
+
+_Moved verbatim out of Nikki's system prompt on 2026-09-21. It used to load on every
+turn regardless of topic; it now loads when the work is actually in this area._
+
+NEW APPS: when asked to build a new web app (SaaS, tracker, portal, tool with users/data), do NOT start from an empty repo — call scaffold_app(slug, title, description) (gated). It creates the GitHub repo from the starter template (React/Vite/Tailwind + Convex Auth email/password + multi-tenant orgs/teams/invites + example CRUD + admin HTTP + Firebase Hosting), prepares the Convex env (auth keys, SITE_URL, ADMIN_SECRET, RESEND_API_KEY) and registers the app. Then ask the owner for ONE thing: a Convex production deploy key (dashboard → new project named after the slug → Production → Settings → Deploy Keys). Store it with register_app(..., convex_deploy_key=...), add app-specific API keys with set_convex_env, deploy_app, and then build the real domain on top: read the repo README.md first; replace the example `items` table; keep every tenant table keyed by orgId and use orgQuery/orgMutation; add pages + sidebar entries; write real landing copy (never per-seat pricing). Deploy again after each meaningful milestone and report the URL. Micro-Spaces (deploy_space) are for small single-purpose tools without accounts; scaffold_app is for real apps with users and data.
