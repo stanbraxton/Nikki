@@ -69,10 +69,22 @@ Tool functions must **return errors as text**, never raise. A raised exception i
 
 - Prefer push-to-deploy only. There's also a manual `scripts/deploy.sh` / `deploy_now.sh` / a `deploy_self` engineer tool — using either of those *as well as* pushing to main double-deploys; pick one path per change.
 - gcloud CLI calls from an agent sandbox routinely take 25–35 seconds — always run them in the background/detached and poll for completion rather than using a short synchronous timeout.
-- **`--no-traffic` silently disables push-to-deploy. Always restore it.** The service normally carries `spec.traffic = [{latestRevision: true, percent: 100}]`, so each new revision is promoted automatically. Deploying a canary with `--no-traffic` rewrites that to pin 100% to one revision *by name*, and `cloudbuild.yaml`'s deploy step passes no traffic flags — so every later push to `main` builds and deploys a revision serving **0% traffic**. Green build, successful deploy, production still on the old code. Restore the moment canary testing ends:
+- **`--no-traffic` silently disables push-to-deploy. Always restore it — but not with `--to-latest`.** The service normally carries `spec.traffic = [{latestRevision: true, percent: 100}]`, so each new revision is promoted automatically. Deploying a canary with `--no-traffic` rewrites that to pin 100% to one revision *by name*, and `cloudbuild.yaml`'s deploy step passes no traffic flags — so every later push to `main` builds and deploys a revision serving **0% traffic**. Green build, successful deploy, production still on the old code.
+
+  The obvious restore is wrong. `--to-latest` sends 100% to the *newest* revision, which immediately after a canary **is the canary** — it promotes the thing you deployed specifically not to serve. Restore by name instead, to the revision that was serving before:
 
   ```bash
-  gcloud run services update-traffic nikki --to-latest --region us-east4 --project nikkiaia-prod
+  gcloud run services update-traffic nikki --to-revisions=<previous>=100 \
+    --region us-east4 --project nikkiaia-prod
+  ```
+
+  Only go back to `--to-latest` once the service template is back on the image you actually intend to serve.
+
+- **`--no-traffic` also moves the service *template* to the canary image.** The revision serves nothing, but the template does not stay behind — so a later config-only `gcloud run services update` (setting an env var, say) builds its new revision on the **canary** image and can quietly put it in production. Any config-only update made while a canary is the most recent deploy must pass `--image` explicitly to pin the intended image:
+
+  ```bash
+  gcloud run services describe nikki --region us-east4 --project nikkiaia-prod \
+    --format='value(spec.template.spec.containers[0].image)'
   ```
 
 - **Env vars on the service override `app/config.py` defaults — check before assuming a config change is live.** `scripts/deploy.sh` sets `NIKKI_MODEL` explicitly in `--set-env-vars`, so `config.py`'s `_env("NIKKI_MODEL", ...)` default is inert in production: the live service decides. This bit once already — the script's default sat at `claude-sonnet-4-5` for a full generation after the code default moved on (fixed 2026-09-21; **if you change one, change both**). `NIKKI_ENGINEER_MODEL` and `NIKKI_THINKING_BUDGET_TOKENS` are *not* set on the service, so those *do* follow the code default — meaning one deploy can land half-applied: the settings with no env var activate silently while the one that has an env var does not move. Read the live values before concluding a model change shipped:
