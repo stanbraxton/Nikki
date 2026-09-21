@@ -36,19 +36,13 @@ def make_model(spec: str | None = None) -> BaseChatModel:
             # Extended thinking needs max_tokens > budget, and temperature fixed at 1.
             # The UI already renders thinking blocks (stream_segment handles
             # content blocks of type "thinking"); the model just never emitted any.
+            # requirements.txt pins langchain-anthropic>=1.7.2,<2, where `thinking` is a
+            # real constructor field. There is deliberately no fallback here: on a build
+            # without that field pydantic does NOT raise, it shunts the kwarg into
+            # model_kwargs with a UserWarning, so any try/except around this is dead code.
             kwargs.update({"max_tokens": max(settings.max_tokens, budget + 4096),
                            "temperature": 1,
                            "thinking": {"type": "enabled", "budget_tokens": budget}})
-            try:
-                return ChatAnthropic(**kwargs)
-            except TypeError:
-                # langchain-anthropic is unpinned in requirements.txt; an older
-                # build has no `thinking` kwarg. Degrade rather than break every turn.
-                log.warning("langchain-anthropic does not accept `thinking`; "
-                            "continuing without extended thinking")
-                for k in ("thinking", "temperature"):
-                    kwargs.pop(k, None)
-                kwargs["max_tokens"] = settings.max_tokens
         return ChatAnthropic(**kwargs)
     if provider == "openai":
         from langchain_openai import ChatOpenAI

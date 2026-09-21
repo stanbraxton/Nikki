@@ -4,7 +4,11 @@ uvicorn[standard]
 websockets
 langgraph>=0.6
 langchain-core
-langchain-anthropic
+# Pinned: `thinking` (extended thinking) must be a real constructor field. On a build
+# without it the kwarg is NOT rejected - pydantic silently shunts it into model_kwargs
+# with a UserWarning, so make_model()'s `except TypeError` never fires and the turn
+# fails later at the API call instead. Floor guarantees the field; <2 stops a major bump.
+langchain-anthropic>=1.7.2,<2
 langchain-openai
 openai>=1.0
 langgraph-checkpoint-postgres
