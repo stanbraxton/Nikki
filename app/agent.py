@@ -7,6 +7,7 @@ inspects pending tool calls, asks the human for approval where required, and res
 from __future__ import annotations
 
 import logging
+import socket
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -67,6 +68,63 @@ def is_too_large_error(e: BaseException) -> bool:
     return any(m in txt for m in _TOO_LARGE_MARKERS)
 
 
+def _is_transient_error(e: BaseException) -> bool:
+    """True when retrying the same request could plausibly succeed."""
+    if isinstance(e, (TimeoutError, ConnectionError, socket.timeout, socket.gaierror)):
+        return True
+    try:
+        import httpx
+        # Timeouts, connection resets, DNS failures, protocol errors.
+        if isinstance(e, (httpx.TimeoutException, httpx.TransportError)):
+            return True
+        if isinstance(e, httpx.HTTPStatusError):
+            code = e.response.status_code
+            return code == 429 or 500 <= code < 600
+    except ImportError:
+        pass
+    return False
+
+
+# Deterministic failures: the same input will fail the same way every time,
+# so telling the user to resend just burns their tokens and their patience.
+#
+# ORDER MATTERS — ConnectionError and TimeoutError are subclasses of OSError,
+# so _is_transient_error() must be consulted before this tuple is tested.
+_BUG_ERRORS = (
+    OSError,            # FileNotFoundError, PermissionError, IsADirectoryError, ...
+    TypeError,
+    ValueError,         # includes json.JSONDecodeError
+    KeyError,
+    IndexError,
+    AttributeError,
+    NameError,
+    ImportError,
+    ZeroDivisionError,
+    AssertionError,
+    NotImplementedError,
+)
+
+
+def _bug_hint(e: BaseException) -> str:
+    """One extra line pointing at the likely cause, when we can guess it."""
+    if isinstance(e, FileNotFoundError):
+        return (
+            "\n\nThis is usually a tool writing to a path that does not exist in the "
+            "container — a relative path resolved against a missing working directory, "
+            "or `mkdir()` without `parents=True`."
+        )
+    if isinstance(e, PermissionError):
+        return (
+            "\n\nThis is usually a tool writing outside the one writable location: on "
+            "Cloud Run the filesystem is read-only apart from /tmp and mounted volumes."
+        )
+    if isinstance(e, ImportError):
+        return "\n\nThis is usually a dependency missing from the deployed image."
+    if isinstance(e, (KeyError, AttributeError, TypeError)):
+        return "\n\nThis is usually a tool receiving a payload in a shape it did not expect."
+    return ""
+
+
 def friendly_error(e: BaseException) -> str:
     """Human-readable message for an unrecoverable turn failure: problem / solutions / recommendation."""
     if is_billing_error(e):
@@ -87,13 +145,44 @@ def friendly_error(e: BaseException) -> str:
             "3. Raise the provider's rate limits (OpenAI: platform.openai.com/account/rate-limits).\n\n"
             "**Recommendation:** option 1 — fastest and free."
         )
+
+    # Always put the full traceback in the logs, whatever branch we return.
+    log.exception("Turn failed: %s", type(e).__name__)
+
+    detail = f"`{type(e).__name__}: {str(e)[:600]}`"
+
+    if _is_transient_error(e):
+        return (
+            f"⚠️ **Problem:** the request failed with {detail}. This looks transient — "
+            "a network timeout or a provider hiccup.\n\n"
+            "**Possible solutions:**\n"
+            "1. Send the message again.\n"
+            "2. Start a new thread if the error repeats.\n"
+            "3. Ask Stan to check the service logs if it persists.\n\n"
+            "**Recommendation:** option 1 first, then 2."
+        )
+
+    if isinstance(e, _BUG_ERRORS):
+        return (
+            f"⚠️ **Problem:** the request failed with {detail}. This is a bug in my code, "
+            "not a hiccup — **resending will produce the same error.**"
+            f"{_bug_hint(e)}\n\n"
+            "**Possible solutions:**\n"
+            "1. Ask Stan to check the service logs — the full traceback is there, with the "
+            "file and line number.\n"
+            "2. Rephrase so the request takes a different path (a different tool, or fewer "
+            "files at once), if you need an answer before it is fixed.\n\n"
+            "**Recommendation:** option 1 — this one needs a code change."
+        )
+
     return (
-        f"⚠️ **Problem:** the request failed with `{type(e).__name__}: {str(e)[:600]}`.\n\n"
+        f"⚠️ **Problem:** the request failed with {detail}. I cannot tell whether this is "
+        "transient or a bug.\n\n"
         "**Possible solutions:**\n"
-        "1. Send the message again (transient provider errors are common).\n"
-        "2. Start a new thread if the error repeats.\n"
-        "3. Ask Stan to check the service logs if it persists.\n\n"
-        "**Recommendation:** option 1 first, then 2."
+        "1. Send the message once more — if it fails identically, it is not transient.\n"
+        "2. Start a new thread.\n"
+        "3. Ask Stan to check the service logs.\n\n"
+        "**Recommendation:** option 1 once, then option 3 — do not keep resending."
     )
 
 
