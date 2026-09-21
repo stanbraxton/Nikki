@@ -27,13 +27,61 @@ def make_model(spec: str | None = None) -> BaseChatModel:
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
-        return ChatAnthropic(model=name, max_tokens=settings.max_tokens, streaming=True, api_key=settings.anthropic_api_key)
+        kwargs: dict[str, Any] = {"model": name, "streaming": True,
+                                  "api_key": settings.anthropic_api_key,
+                                  "max_tokens": settings.max_tokens}
+        budget = settings.thinking_budget_tokens
+        if budget > 0:
+            # Extended thinking needs max_tokens > budget, and temperature fixed at 1.
+            # The UI already renders thinking blocks (stream_segment handles
+            # content blocks of type "thinking"); the model just never emitted any.
+            kwargs.update({"max_tokens": max(settings.max_tokens, budget + 4096),
+                           "temperature": 1,
+                           "thinking": {"type": "enabled", "budget_tokens": budget}})
+            try:
+                return ChatAnthropic(**kwargs)
+            except TypeError:
+                # langchain-anthropic is unpinned in requirements.txt; an older
+                # build has no `thinking` kwarg. Degrade rather than break every turn.
+                log.warning("langchain-anthropic does not accept `thinking`; "
+                            "continuing without extended thinking")
+                for k in ("thinking", "temperature"):
+                    kwargs.pop(k, None)
+                kwargs["max_tokens"] = settings.max_tokens
+        return ChatAnthropic(**kwargs)
     if provider == "openai":
         from langchain_openai import ChatOpenAI
 
         return ChatOpenAI(model=name, streaming=True, api_key=settings.openai_api_key)
     raise ValueError(f"unknown model provider: {provider!r} (use anthropic:<model> or openai:<model>)")
 
+
+
+# Tools that mean this turn is engineering work rather than conversation.
+ENGINEER_TOOLS = {
+    "repo_open", "repo_read", "repo_search", "repo_write", "repo_edit", "repo_git",
+    "repo_check", "repo_commit_push", "repo_run", "deploy_app", "deploy_self",
+    "scaffold_app", "build_log", "app_status", "set_convex_env",
+}
+
+_ENGINEER_HINTS = ("repo", "deploy", "build", "convex", "typescript", "commit", "push",
+                   "schema", "mutation", "import error", "typecheck", "wellcollar",
+                   "branch", "pull request", "stack trace", "traceback")
+
+
+def route_model(user_text: str, recent_tools: set[str] | None = None) -> str | None:
+    """An Opus-class model for engineering turns, when NIKKI_ENGINEER_MODEL is set.
+
+    Returns None when routing is off or the turn looks like ordinary conversation,
+    so the caller keeps whatever model is already selected. Sermon coaching and a
+    Convex refactor are not the same cognitive task and should not share a model.
+    """
+    if not settings.engineer_model:
+        return None
+    if recent_tools and (recent_tools & ENGINEER_TOOLS):
+        return settings.engineer_model
+    t = (user_text or "").lower()
+    return settings.engineer_model if any(h in t for h in _ENGINEER_HINTS) else None
 
 _BILLING_MARKERS = ("credit balance is too low", "insufficient_quota", "billing_hard_limit_reached", "exceeded your current quota")
 

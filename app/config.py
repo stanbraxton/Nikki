@@ -46,6 +46,10 @@ class Settings:
     max_repeated_tool_calls: int = int(_env("NIKKI_MAX_REPEATED_TOOL_CALLS", "2"))
     # Hard ceiling on input+output tokens for one turn. 0 disables.
     turn_token_ceiling: int = int(_env("NIKKI_TURN_TOKEN_CEILING", "400000"))
+    # Extended thinking budget, Anthropic only. 0 = off. Raises max_tokens when set.
+    thinking_budget_tokens: int = int(_env("NIKKI_THINKING_BUDGET_TOKENS", "0"))
+    # Model for turns that touch the engineer toolchain. Empty = no routing.
+    engineer_model: str = _env("NIKKI_ENGINEER_MODEL", "") or ""
     # Persistence. Postgres in prod (postgresql://user:pw@/db?host=/cloudsql/...),
     # SQLite locally.
     database_url: str = _env("DATABASE_URL", f"sqlite:///{ROOT / 'data' / 'nikki.db'}")

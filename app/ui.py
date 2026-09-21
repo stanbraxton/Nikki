@@ -12,7 +12,7 @@ from chainlit.input_widget import Select
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
 from app import persistence
-from app.agent import build_graph, fallback_model_for, friendly_error, is_billing_error, pending_tool_calls, rejection_messages, text_of
+from app.agent import build_graph, fallback_model_for, friendly_error, is_billing_error, pending_tool_calls, rejection_messages, route_model, text_of
 from app.guards import TurnBudget
 from app.tools.artifacts import FILE_MARK, marks_in
 from app.tools.images import IMAGE_MARK
@@ -603,6 +603,13 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
     user_content = message.content
     if message.elements:
         user_content = await asyncio.to_thread(ingest_uploads, message.content, message.elements)
+
+    # Route engineering turns to a stronger model, unless the user picked one
+    # explicitly in the chat settings panel (an explicit choice always wins).
+    routed = route_model(message.content)
+    if routed and (cl.user_session.get("model") or settings.model) == settings.model:
+        model = routed
+        await persistence.trace(thread_id, "model_routed", {"to": routed})
 
     try:
         async with persistence.checkpointer() as cp:
