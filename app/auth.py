@@ -163,6 +163,62 @@ async def api_me(p: Principal = Depends(require_principal)) -> dict:
     return {"email": p.email, "tenant_id": p.tenant_id, "role": p.role}
 
 
+# ── /account/password — DISABLED, do not re-enable without fixing all three ──────
+# The handlers below are intact but NOT registered: both @router decorators are
+# commented out, so the routes 404. Added in e06c8ab, the page never served a single
+# request in production (its revision sat at 0% traffic behind a canary pin), so
+# enabling it would be its production debut, not a continuation.
+#
+# Blocking issues, all three to be fixed in one reviewed commit:
+#
+#   1. Admin password changes silently revert. authenticate() checks password_hash
+#      from the DB (see below), and password_submit writes the new hash there - so
+#      the change works at first. But ensure_admin() overwrites the admin row with
+#      settings.admin_password_hash on every startup ("keep the env hash
+#      authoritative"), so the next deploy or cold start quietly restores the old
+#      password with no error anywhere. Non-admin accounts are unaffected.
+#   2. No rate limiting on the current-password check - a password-guessing oracle.
+#   3. _password_form(error=...) interpolates into HTML unescaped. Not exploitable
+#      while every caller passes a literal, but one user-derived message away.
+#
+# To re-enable: fix the above, then uncomment the two decorators.
+# @router.get("/account/password", response_class=HTMLResponse, include_in_schema=False)
+async def password_page(p: Principal = Depends(require_principal)):
+    return HTMLResponse(_password_form())
+
+
+# @router.post("/account/password", response_class=HTMLResponse, include_in_schema=False)
+async def password_submit(request: Request, current: str = Form(...), new: str = Form(...),
+                          confirm: str = Form(...), p: Principal = Depends(require_principal)):
+    # Validate new password
+    if len(new) < 10:
+        return HTMLResponse(_password_form(error="New password must be at least 10 characters"), status_code=400)
+    if new != confirm:
+        return HTMLResponse(_password_form(error="New passwords don't match"), status_code=400)
+    
+    # Verify current password (skip for admin if using env hash)
+    a = persistence.accounts
+    async with persistence.engine().begin() as conn:
+        row = (await conn.execute(select(a.c.password_hash).where(a.c.email == p.email))).first()
+        if not row:
+            return HTMLResponse(_password_form(error="Account not found"), status_code=400)
+        
+        # Admin account password is controlled by env var, check against that
+        if p.email == settings.admin_username.strip().lower() and settings.admin_password_hash:
+            if not check_password(current, settings.admin_password_hash):
+                return HTMLResponse(_password_form(error="Current password is incorrect"), status_code=400)
+        else:
+            if not check_password(current, row.password_hash):
+                return HTMLResponse(_password_form(error="Current password is incorrect"), status_code=400)
+        
+        # Update password
+        new_hash = hash_password(new)
+        await conn.execute(update(a).where(a.c.email == p.email).values(password_hash=new_hash))
+    
+    log.info("password changed for %s", p.email)
+    return HTMLResponse(_page("Password changed", "Your password has been updated successfully."))
+
+
 # ---------------------------------------------------------------- html
 STYLE = """<style>body{margin:0;background:#0f1014;color:#e8e9f0;font:15px/1.6 -apple-system,Segoe UI,Inter,sans-serif;display:grid;place-items:center;min-height:100vh}
 .card{background:#171922;border:1px solid #262a38;border-radius:14px;padding:28px 32px;width:min(420px,92vw)}h1{font-size:20px;margin:0 0 6px}p{margin:8px 0}
@@ -186,3 +242,16 @@ def _signup_form(error: str = "", email: str = "", name: str = "") -> str:
 {err}
 <button type="submit">Create account</button></form>
 <p class="muted" style="margin-top:14px">Already have an account? <a href="/login">Sign in</a> · <a href="/terms">Terms</a> · <a href="/privacy">Privacy</a></p></div></body></html>"""
+
+
+def _password_form(error: str = "") -> str:
+    err = f'<div class="err">{error}</div>' if error else ""
+    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Change Password · Nikki</title><link rel="icon" type="image/png" href="/public/favicon.png"><link rel="apple-touch-icon" href="/public/apple-touch-icon.png">{STYLE}</head>
+<body><div class="card"><h1><img src="/public/avatars/nikki.png" alt="" style="width:34px;height:34px;border-radius:50%;vertical-align:middle;margin-right:10px">Change Password</h1><p class="muted">Update your account password</p>
+<form method="post" action="/account/password">
+<label>Current password<input name="current" type="password" required></label>
+<label>New password <span class="muted">(10+ characters)</span><input name="new" type="password" minlength="10" required></label>
+<label>Confirm new password<input name="confirm" type="password" minlength="10" required></label>
+{err}
+<button type="submit">Change password</button></form>
+<p class="muted" style="margin-top:14px"><a href="/">← Back to Nikki</a></p></div></body></html>"""
