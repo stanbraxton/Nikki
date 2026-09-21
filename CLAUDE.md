@@ -69,6 +69,18 @@ Tool functions must **return errors as text**, never raise. A raised exception i
 
 - Prefer push-to-deploy only. There's also a manual `scripts/deploy.sh` / `deploy_now.sh` / a `deploy_self` engineer tool — using either of those *as well as* pushing to main double-deploys; pick one path per change.
 - gcloud CLI calls from an agent sandbox routinely take 25–35 seconds — always run them in the background/detached and poll for completion rather than using a short synchronous timeout.
+- **`--no-traffic` silently disables push-to-deploy. Always restore it.** The service normally carries `spec.traffic = [{latestRevision: true, percent: 100}]`, so each new revision is promoted automatically. Deploying a canary with `--no-traffic` rewrites that to pin 100% to one revision *by name*, and `cloudbuild.yaml`'s deploy step passes no traffic flags — so every later push to `main` builds and deploys a revision serving **0% traffic**. Green build, successful deploy, production still on the old code. Restore the moment canary testing ends:
+
+  ```bash
+  gcloud run services update-traffic nikki --to-latest --region us-east4 --project nikkiaia-prod
+  ```
+
+- **Env vars on the service override `app/config.py` defaults — check before assuming a config change is live.** `scripts/deploy.sh` sets `NIKKI_MODEL` explicitly in `--set-env-vars`, and it is still `anthropic:claude-sonnet-4-5` there. `config.py` reads `_env("NIKKI_MODEL", ...)`, so the env var wins and changing the code default does nothing in production. `NIKKI_ENGINEER_MODEL` and `NIKKI_THINKING_BUDGET_TOKENS` are *not* set on the service, so those do follow the code default — which means a deploy can land in a half-applied state: thinking and engineer routing active, base model unchanged. Read the live values before concluding a model change shipped:
+
+  ```bash
+  gcloud run services describe nikki --region us-east4 --project nikkiaia-prod \
+    --format='value(spec.template.spec.containers[0].env)'
+  ```
 
 ## 4. Model configuration, fallback, and turn budget
 
