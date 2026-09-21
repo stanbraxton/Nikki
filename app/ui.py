@@ -251,6 +251,34 @@ class TurnRenderer:
         self.final_text: list[str] = []
         self.input_tokens: int = 0
         self.output_tokens: int = 0
+        self._usage_seen: set[str] = set()
+
+    def note_usage(self, msg: Any, *, final: bool = False) -> None:
+        """Accumulate this turn's token usage, counting each model call once.
+
+        Two things were wrong before. The usage fields were ASSIGNED, not added,
+        and _drive calls stream_segment once per tool round with the same
+        renderer -- so a multi-round turn logged only its last call, which is
+        exactly backwards for spotting runaway turns. And astream runs with
+        stream_mode=["messages", "updates"], so the same model call arrives
+        twice: as streamed chunks and again as the completed AIMessage. Simply
+        adding in both places would double every count.
+
+        Chunks of one message share its id, so dedupe on that. An id-less
+        message can only be counted from the authoritative `updates` pass.
+        """
+        usage = getattr(msg, "usage_metadata", None)
+        if not usage:
+            return
+        key = getattr(msg, "id", None)
+        if key is not None:
+            if key in self._usage_seen:
+                return
+            self._usage_seen.add(key)
+        elif not final:
+            return
+        self.input_tokens += usage.get("input_tokens") or 0
+        self.output_tokens += usage.get("output_tokens") or 0
 
     async def token(self, text: str) -> None:
         if self.msg is None:
@@ -323,11 +351,7 @@ async def stream_segment(graph, config: dict, inp: Any, r: TurnRenderer) -> None
             msg, meta = chunk
             if meta.get("langgraph_node") != "agent" or not isinstance(msg, AIMessageChunk):
                 continue
-            # Capture token usage from message metadata
-            if hasattr(msg, "usage_metadata") and msg.usage_metadata:
-                usage = msg.usage_metadata
-                r.input_tokens = usage.get("input_tokens", 0)
-                r.output_tokens = usage.get("output_tokens", 0)
+            r.note_usage(msg)
             content = msg.content
             if isinstance(content, list):
                 for block in content:
@@ -342,11 +366,7 @@ async def stream_segment(graph, config: dict, inp: Any, r: TurnRenderer) -> None
                     continue
                 for m in update.get("messages", []):
                     if node == "agent" and isinstance(m, AIMessage):
-                        # Capture usage from complete AIMessage too
-                        if hasattr(m, "usage_metadata") and m.usage_metadata:
-                            usage = m.usage_metadata
-                            r.input_tokens = usage.get("input_tokens", 0)
-                            r.output_tokens = usage.get("output_tokens", 0)
+                        r.note_usage(m, final=True)
                         if m.tool_calls:
                             await r.close_segment()
                             for tc in m.tool_calls:
