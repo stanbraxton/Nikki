@@ -13,6 +13,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Too
 
 from app import persistence
 from app.agent import build_graph, fallback_model_for, friendly_error, is_billing_error, pending_tool_calls, rejection_messages, text_of
+from app.guards import TurnBudget
 from app.tools.artifacts import FILE_MARK, marks_in
 from app.tools.images import IMAGE_MARK
 from app.config import settings
@@ -239,10 +240,30 @@ async def _on_reject(action: cl.Action) -> None:
 
 
 # ---------------------------------------------------------------- streaming
+# One budget per USER TURN, keyed by thread, shared across approval continuations.
+#
+# An approval pauses the turn and resumes it as a fresh Chainlit turn with a new
+# TurnRenderer. Holding the budget on the renderer would reset the repeat counters
+# at every approval -- and the loop this guards against is made of GATED calls
+# (repo_commit_push x3 on 2026-09-18), so it would have reset each time and caught
+# nothing. Keyed to the thread, the counters survive the pause.
+_turn_budgets: dict[str, TurnBudget] = {}
+
+
+def turn_budget(thread_id: str, *, new_turn: bool) -> TurnBudget:
+    if new_turn or thread_id not in _turn_budgets:
+        _turn_budgets[thread_id] = TurnBudget(
+            max_tool_rounds=settings.max_tool_rounds,
+            max_repeats=settings.max_repeated_tool_calls,
+            token_ceiling=settings.turn_token_ceiling,
+        )
+    return _turn_budgets[thread_id]
+
+
 class TurnRenderer:
     """Turns LangGraph stream events into Chainlit messages and steps."""
 
-    def __init__(self, thread_id: str) -> None:
+    def __init__(self, thread_id: str, *, new_turn: bool = True) -> None:
         self.thread_id = thread_id
         self.msg: cl.Message | None = None
         self.msg_text: list[str] = []  # accumulate streamed tokens for persistence
@@ -252,6 +273,7 @@ class TurnRenderer:
         self.input_tokens: int = 0
         self.output_tokens: int = 0
         self._usage_seen: set[str] = set()
+        self.budget = turn_budget(thread_id, new_turn=new_turn)
 
     def note_usage(self, msg: Any, *, final: bool = False) -> None:
         """Accumulate this turn's token usage, counting each model call once.
@@ -401,12 +423,56 @@ async def on_message(message: cl.Message) -> None:
 async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "TurnRenderer", thread_id: str, preapproved: bool | None = None) -> None:
     """Run one turn until complete or until an approval checkpoint is rendered."""
     while True:
+        r.budget.start_round()
         await stream_segment(graph, config, inp, r)
         await r.close_segment()
+
+        # Budget spent: stop cleanly rather than letting recursion_limit throw.
+        stop = r.budget.stop_reason(r.input_tokens, r.output_tokens)
+        if stop:
+            log.warning("turn %s stopped by budget: %s", thread_id,
+                        r.budget.summary(r.input_tokens, r.output_tokens))
+            await persistence.trace(thread_id, "budget_stop", {
+                "rounds": r.budget.rounds,
+                "input_tokens": r.input_tokens,
+                "output_tokens": r.output_tokens,
+            })
+            await cl.Message(content=stop).send()
+            _turn_budgets.pop(thread_id, None)
+            return
+
         state = await graph.aget_state(config)
         if not state.next:
             break
         calls = pending_tool_calls(state)
+
+        # The same call, with the same arguments, for the third time. This is the
+        # Pivoten failure: "Step 2: Enable Pivoten import HTTP endpoint" pushed
+        # three times because nothing remembered the first two.
+        repeats = [tc for tc in calls if r.budget.would_repeat(tc["name"], tc.get("args"))]
+        if repeats:
+            log.warning("turn %s blocked repeated calls: %s", thread_id,
+                        [tc["name"] for tc in repeats])
+            await persistence.trace(thread_id, "repeat_blocked",
+                                    {"tools": [tc["name"] for tc in repeats]})
+            for tc in calls:
+                step = r.steps.pop(tc["id"], None)
+                if step:
+                    step.output = "blocked: identical call already tried this turn"
+                    step.is_error = True
+                    await step.update()
+            await graph.aupdate_state(
+                config,
+                {"messages": rejection_messages(calls, r.budget.repeat_message(repeats[0]["name"]))},
+                as_node="tools",
+            )
+            inp = None
+            graph = build_graph(cp, model)
+            continue
+
+        for tc in calls:
+            r.budget.record(tc["name"], tc.get("args"))
+
         gated = [tc for tc in calls if registry.requires_approval(tc["name"], tc.get("args"))]
         if gated:
             if preapproved is None:
@@ -426,6 +492,7 @@ async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "Tu
         # resume from the interrupt; rebuild so hot-loaded skills are bound to the model
         inp = None
         graph = build_graph(cp, model)
+    _turn_budgets.pop(thread_id, None)  # turn finished normally
 
 
 async def _continue_approval(thread_id: str, approved: bool, approval_id: str | None = None) -> bool:
@@ -444,7 +511,7 @@ async def _continue_approval(thread_id: str, approved: bool, approval_id: str | 
         async with lock:
             model = cl.user_session.get("model") or settings.model
             config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.recursion_limit}
-            r = TurnRenderer(thread_id)
+            r = TurnRenderer(thread_id, new_turn=False)
             try:
                 approval_id, claim = await persistence.claim_pending_approval(
                     thread_id, principal.tenant_id, principal.email, approved, approval_id

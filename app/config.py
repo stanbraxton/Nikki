@@ -36,7 +36,16 @@ class Settings:
     # tool results from earlier turns are shortened to this many chars before being re-sent (0 = off)
     old_tool_result_chars: int = int(_env("NIKKI_OLD_TOOL_RESULT_CHARS", "1500"))
     max_tokens: int = int(_env("NIKKI_MAX_TOKENS", "4096"))
-    recursion_limit: int = int(_env("NIKKI_RECURSION_LIMIT", "40"))
+    # Graph-level step cap. Was 40 - higher than LangGraph's own default of 25,
+    # so a looping turn ran nearly twice as long before anything stopped it.
+    recursion_limit: int = int(_env("NIKKI_RECURSION_LIMIT", "18"))
+    # Tool rounds in one user turn (one round = one model call plus its tools).
+    max_tool_rounds: int = int(_env("NIKKI_MAX_TOOL_ROUNDS", "16"))
+    # How many times one tool may be called with identical arguments in a turn
+    # before the call is refused. 2 allows a legitimate retry; 3+ is a loop.
+    max_repeated_tool_calls: int = int(_env("NIKKI_MAX_REPEATED_TOOL_CALLS", "2"))
+    # Hard ceiling on input+output tokens for one turn. 0 disables.
+    turn_token_ceiling: int = int(_env("NIKKI_TURN_TOKEN_CEILING", "400000"))
     # Persistence. Postgres in prod (postgresql://user:pw@/db?host=/cloudsql/...),
     # SQLite locally.
     database_url: str = _env("DATABASE_URL", f"sqlite:///{ROOT / 'data' / 'nikki.db'}")
