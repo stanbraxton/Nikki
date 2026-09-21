@@ -9,9 +9,11 @@ Pivoten import HTTP endpoint" three separate times, each triggering a full Cloud
 Build, because nothing recorded that the same two-step dance had already been
 tried. Every guard below exists to make that specific failure cheap.
 
-`convex_lint` is verified by tests/test_guards.py against the real source of
-four files in this portfolio — two with live bugs, two already fixed. Run it
-before trusting any change to the patterns.
+`convex_lint` is verified by tests/test_guards.py, which exercises it against the
+real source of four files in this portfolio — two carrying live build failures,
+two already correct. The negative cases are the load-bearing ones: three earlier
+revisions of this lint each flagged code that compiles fine. Run the tests before
+trusting any change to the patterns.
 """
 from __future__ import annotations
 
