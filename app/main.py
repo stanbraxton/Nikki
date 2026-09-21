@@ -15,6 +15,7 @@ from app.integrations.routes import router as integrations_router
 from app.legal import router as legal_router
 from app.scheduler import router as scheduler_router
 from app.spaces_gallery import router as spaces_router
+from app.turns import router as turns_router
 from app.voice import router as voice_router
 from app.config import ROOT, settings
 from app.tools import registry
@@ -86,6 +87,7 @@ async def kb_file(name: str):
 
 
 app.include_router(spaces_router)
+app.include_router(turns_router)
 app.include_router(auth_router)
 app.include_router(canvas_router)
 app.include_router(integrations_router)
