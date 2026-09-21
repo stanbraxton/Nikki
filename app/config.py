@@ -58,9 +58,11 @@ class Settings:
     # rendered thinking blocks (stream_segment handles them); the model was never asked for any.
     thinking_budget_tokens: int = int(_env("NIKKI_THINKING_BUDGET_TOKENS", "4000"))
     # Model for turns that touch the engineer toolchain. Empty = no routing.
-    # An Opus-class model for engineering turns confines the cost increase to the turns that
-    # need the reasoning; ordinary conversation stays on the cheaper default above.
-    engineer_model: str = _env("NIKKI_ENGINEER_MODEL", "anthropic:claude-opus-5") or ""
+    # Deliberately the SAME model as `model` above for now, so routing is live and exercised
+    # but costs nothing extra. Extended thinking and the sonnet-5 bump ship as one change and
+    # their cost impact can be read on its own; stacking an Opus-class model on engineering
+    # turns is a separate decision, made once there is a bill to compare against.
+    engineer_model: str = _env("NIKKI_ENGINEER_MODEL", "anthropic:claude-sonnet-5") or ""
     # Persistence. Postgres in prod (postgresql://user:pw@/db?host=/cloudsql/...),
     # SQLite locally.
     database_url: str = _env("DATABASE_URL", f"sqlite:///{ROOT / 'data' / 'nikki.db'}")
