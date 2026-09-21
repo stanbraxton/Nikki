@@ -49,7 +49,17 @@ accept = [
     "audio/webm",
     "audio/ogg",
     "video/mp4",
-    "video/webm"
+    "video/webm",
+    "text/x-python",
+    "application/x-python-code",
+    "text/javascript",
+    "application/javascript",
+    "text/x-typescript",
+    "text/html",
+    "text/css",
+    "text/x-sh",
+    "text/x-toml",
+    "application/toml"
 ]
 
 [UI]
