@@ -13,7 +13,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Too
 
 from app import persistence
 from app.agent import build_graph, fallback_model_for, friendly_error, is_billing_error, pending_tool_calls, rejection_messages, route_model, text_of
-from app.guards import TurnBudget
+from app.guards import TurnBudget, UsageMeter
 from app.tools.artifacts import FILE_MARK, marks_in
 from app.tools.images import IMAGE_MARK
 from app.config import settings
@@ -270,37 +270,21 @@ class TurnRenderer:
         self.reasoning: cl.Step | None = None
         self.steps: dict[str, cl.Step] = {}
         self.final_text: list[str] = []
-        self.input_tokens: int = 0
-        self.output_tokens: int = 0
-        self._usage_seen: set[str] = set()
+        self.usage = UsageMeter()
         self.budget = turn_budget(thread_id, new_turn=new_turn)
 
+    @property
+    def input_tokens(self) -> int:
+        return self.usage.input_tokens
+
+    @property
+    def output_tokens(self) -> int:
+        return self.usage.output_tokens
+
     def note_usage(self, msg: Any, *, final: bool = False) -> None:
-        """Accumulate this turn's token usage, counting each model call once.
-
-        Two things were wrong before. The usage fields were ASSIGNED, not added,
-        and _drive calls stream_segment once per tool round with the same
-        renderer -- so a multi-round turn logged only its last call, which is
-        exactly backwards for spotting runaway turns. And astream runs with
-        stream_mode=["messages", "updates"], so the same model call arrives
-        twice: as streamed chunks and again as the completed AIMessage. Simply
-        adding in both places would double every count.
-
-        Chunks of one message share its id, so dedupe on that. An id-less
-        message can only be counted from the authoritative `updates` pass.
-        """
-        usage = getattr(msg, "usage_metadata", None)
-        if not usage:
-            return
-        key = getattr(msg, "id", None)
-        if key is not None:
-            if key in self._usage_seen:
-                return
-            self._usage_seen.add(key)
-        elif not final:
-            return
-        self.input_tokens += usage.get("input_tokens") or 0
-        self.output_tokens += usage.get("output_tokens") or 0
+        """Record token usage for this turn. See guards.UsageMeter for the two traps
+        (assign-vs-accumulate, and the same call arriving on both stream modes)."""
+        self.usage.note(msg, final=final)
 
     async def token(self, text: str) -> None:
         if self.msg is None:

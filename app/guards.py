@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 # ── Turn budget ─────────────────────────────────────────────────────────────
 
@@ -29,6 +30,51 @@ def call_signature(name: str, args: dict | None) -> str:
     except (TypeError, ValueError):
         payload = str(args)
     return f"{name}:{payload}"
+
+
+@dataclass
+class UsageMeter:
+    """Accumulate token usage across a turn, counting each model call exactly once.
+
+    Two traps, both hit in this codebase:
+
+    - The usage fields used to be ASSIGNED rather than added, and a turn makes one
+      model call per tool round, so only the final round was ever recorded. Cost
+      telemetry was least accurate on exactly the runaway turns it exists to find.
+    - astream runs with stream_mode=["messages", "updates"], so one call arrives
+      twice -- as streamed chunks and as the completed AIMessage -- and both carry
+      usage_metadata. Naively adding doubles every count.
+
+    Chunks of one message share its id, so dedupe on that. A message with no id can
+    only be counted from an authoritative (final) observation.
+
+    Shared by the interactive path (TurnRenderer) and the headless path, which had
+    no accounting at all.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    seen: set[str] = field(default_factory=set)
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+    def note(self, msg: Any, *, final: bool = False) -> bool:
+        """Record this message's usage if it has not been counted. True if counted."""
+        usage = getattr(msg, "usage_metadata", None)
+        if not usage:
+            return False
+        key = getattr(msg, "id", None)
+        if key is not None:
+            if key in self.seen:
+                return False
+            self.seen.add(key)
+        elif not final:
+            return False
+        self.input_tokens += usage.get("input_tokens") or 0
+        self.output_tokens += usage.get("output_tokens") or 0
+        return True
 
 
 @dataclass
