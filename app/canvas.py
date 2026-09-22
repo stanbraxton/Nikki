@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Cookie, HTTPException, Depends
@@ -28,6 +29,24 @@ from app import persistence
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/canvas", tags=["canvas"])
+
+# --- Cost guardrails -------------------------------------------------------
+# Realtime bills by wall-clock audio, so an open mic with nobody talking costs
+# the same as a live conversation. A forgotten browser tab is a real bill.
+# Both caps are env-tunable; set either to 0 to disable it.
+MAX_SESSION_SECONDS = int(os.environ.get("CANVAS_MAX_SESSION_SECONDS", "900"))
+IDLE_SECONDS = int(os.environ.get("CANVAS_IDLE_SECONDS", "180"))
+_WATCHDOG_TICK_SECONDS = 5
+
+# Events that prove a human is still in the room. Client audio frames do NOT
+# count: the mic streams silence just as steadily as speech, so counting them
+# would defeat the idle timer entirely.
+_ACTIVITY_EVENTS = frozenset({
+    "input_audio_buffer.speech_started",
+    "input_audio_buffer.committed",
+    "conversation.item.input_audio_transcription.completed",
+    "response.done",
+})
 
 _client: AsyncOpenAI | None = None
 
@@ -50,10 +69,14 @@ class CanvasSession:
         self.session_id: str = ""
         self.running = False
         self.tools = registry.tools(admin=principal.is_admin)
+        self.started_at = 0.0
+        self.last_activity_at = 0.0
+        self.close_reason: str | None = None
         
     async def start(self):
         """Connect to OpenAI Realtime API and start bidirectional streaming."""
         self.running = True
+        self.started_at = self.last_activity_at = time.monotonic()
         
         # Create Realtime session
         # https://platform.openai.com/docs/api-reference/realtime
@@ -80,6 +103,7 @@ class CanvasSession:
             await asyncio.gather(
                 self._relay_client_to_openai(),
                 self._relay_openai_to_client(),
+                self._watchdog(),
                 return_exceptions=True
             )
             
@@ -162,6 +186,7 @@ class CanvasSession:
                         "audio": msg["audio"]
                     }))
                 elif msg.get("type") == "text":
+                    self.last_activity_at = time.monotonic()
                     # Text message (for canvas context or user typing)
                     await self.openai_ws.send(json.dumps({
                         "type": "conversation.item.create",
@@ -179,6 +204,7 @@ class CanvasSession:
                         "type": "response.create"
                     }))
                 elif msg.get("type") == "commit_audio":
+                    self.last_activity_at = time.monotonic()
                     # User stopped speaking, commit the audio buffer
                     await self.openai_ws.send(json.dumps({
                         "type": "input_audio_buffer.commit"
@@ -199,6 +225,9 @@ class CanvasSession:
             async for raw_msg in self.openai_ws:
                 msg = json.loads(raw_msg)
                 event_type = msg.get("type")
+
+                if event_type in _ACTIVITY_EVENTS:
+                    self.last_activity_at = time.monotonic()
                 
                 # Forward transcript and audio to client
                 if event_type in [
@@ -235,6 +264,62 @@ class CanvasSession:
         except Exception as e:
             log.error(f"OpenAI relay error: {e}")
     
+    async def _watchdog(self):
+        """Hang up on sessions that run too long or go quiet.
+
+        Without this a Canvas tab left open bills for its entire lifetime,
+        which is how a voice feature quietly drains an API balance.
+        """
+        try:
+            while self.running:
+                await asyncio.sleep(_WATCHDOG_TICK_SECONDS)
+                if not self.running:
+                    return
+                now = time.monotonic()
+
+                if MAX_SESSION_SECONDS and now - self.started_at >= MAX_SESSION_SECONDS:
+                    await self._close_with_reason(
+                        "session_limit",
+                        f"Voice session ended after {MAX_SESSION_SECONDS // 60} minutes. "
+                        "Open Canvas again to keep going.",
+                    )
+                    return
+
+                if IDLE_SECONDS and now - self.last_activity_at >= IDLE_SECONDS:
+                    await self._close_with_reason(
+                        "idle_timeout",
+                        f"Voice session ended after {IDLE_SECONDS // 60} minutes of silence.",
+                    )
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error(f"Canvas watchdog error: {e}")
+
+    async def _close_with_reason(self, reason: str, message: str):
+        """Tell the client why we are hanging up, then tear both sockets down."""
+        self.running = False
+        self.close_reason = reason
+        log.info(
+            "Canvas session closed (%s) for %s after %.0fs",
+            reason, self.principal.email, time.monotonic() - self.started_at,
+        )
+        try:
+            await self.user_ws.send_json({
+                "type": "session.closed",
+                "reason": reason,
+                "message": message,
+            })
+        except Exception:
+            pass
+        for sock in (self.openai_ws, self.user_ws):
+            if sock is None:
+                continue
+            try:
+                await sock.close()
+            except Exception:
+                pass
+
     async def _execute_tool_call(self, msg: dict):
         """Execute a tool call and send results back to OpenAI + canvas update to client."""
         try:
