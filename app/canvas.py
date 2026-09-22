@@ -103,7 +103,12 @@ class CanvasSession:
         # Convert tools to OpenAI function format
         tool_schemas = []
         for tool in self.tools:
-            schema = tool.get_input_schema()
+            model = tool.get_input_schema()
+            schema = (model.model_json_schema()
+                      if hasattr(model, "model_json_schema") else model.schema())
+            schema.pop("title", None)
+            schema.setdefault("type", "object")
+            schema.setdefault("properties", {})
             tool_schemas.append({
                 "type": "function",
                 "name": tool.name,
