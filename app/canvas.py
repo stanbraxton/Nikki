@@ -71,7 +71,7 @@ class CanvasSession:
                 "OpenAI-Beta": "realtime=v1"
             }
             
-            self.openai_ws = await websockets.connect(uri, extra_headers=headers)
+            self.openai_ws = await websockets.connect(uri, additional_headers=headers)
             log.info(f"Canvas session started for {self.principal.email}")
             
             # Send session configuration
