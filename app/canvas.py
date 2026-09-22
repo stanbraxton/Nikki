@@ -64,11 +64,10 @@ class CanvasSession:
             if not api_key:
                 raise ValueError("OPENAI_API_KEY not configured")
             
-            # Connect to OpenAI Realtime API (WSS)
-            uri = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17"
+            # Connect to OpenAI Realtime API (GA shape - beta retired May 2026)
+            uri = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
             headers = {
-                "Authorization": f"Bearer {api_key}",
-                "OpenAI-Beta": "realtime=v1"
+                "Authorization": f"Bearer {api_key}"
             }
             
             self.openai_ws = await websockets.connect(uri, additional_headers=headers)
@@ -119,24 +118,29 @@ class CanvasSession:
         config = {
             "type": "session.update",
             "session": {
-                "modalities": ["text", "audio"],
+                "type": "realtime",
+                "model": "gpt-realtime",
                 "instructions": instructions,
-                "voice": "nova",
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": "whisper-1"
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500
+                "output_modalities": ["audio"],
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "transcription": {"model": "whisper-1"},
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 500
+                        }
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "voice": "nova"
+                    }
                 },
                 "tools": tool_schemas,
                 "tool_choice": "auto",
-                "temperature": 0.8,
-                "max_response_output_tokens": 4096
+                "max_output_tokens": 4096
             }
         }
         
@@ -198,12 +202,20 @@ class CanvasSession:
                 
                 # Forward transcript and audio to client
                 if event_type in [
+                    # GA names (the beta event shape was retired in May 2026)
+                    "response.output_audio.delta",
+                    "response.output_audio.done",
+                    "response.output_audio_transcript.delta",
+                    "response.output_text.delta",
+                    "conversation.item.added",
+                    "conversation.item.done",
+                    # legacy beta names, kept so either shape still relays
                     "response.audio.delta",
                     "response.audio_transcript.delta",
                     "response.text.delta",
+                    "response.audio.done",
                     "conversation.item.created",
                     "response.done",
-                    "response.audio.done",
                     "input_audio_buffer.speech_started",
                     "input_audio_buffer.speech_stopped",
                     "input_audio_buffer.committed",
