@@ -275,27 +275,42 @@ class CanvasSession:
             })
 
 
-async def get_ws_principal(websocket: WebSocket) -> Principal:
-    """Extract principal from WebSocket cookies (same auth as Chainlit)."""
-    from chainlit.auth import get_current_user
+async def get_ws_principal(websocket: WebSocket) -> Principal | None:
+    """Authenticate a Canvas WebSocket with the same session cookie the UI uses.
+
+    Returns None when the caller is not signed in; the caller MUST then close
+    the socket. There is deliberately no anonymous fallback: this endpoint
+    exposes the full tool set over voice, including the admin-only file, SQL
+    and self-maintenance tools.
+    """
+    import inspect
+
     from app.auth import principal_of
-    
-    # Get cookies from WebSocket
-    cookies = websocket.cookies
-    
-    # Chainlit JWT token is in the 'access_token' cookie
-    token = cookies.get("access_token")
+
+    token = websocket.cookies.get("access_token")
     if not token:
-        # Fall back to checking for chainlit-* cookies (session tokens)
-        # For now, if the user can load the page, they're authenticated
-        # This is safe: the HTML page itself requires auth to load
-        # We just accept any WebSocket connection that made it this far
-        log.warning("Canvas WebSocket: no access_token cookie, allowing connection (page already auth-gated)")
-        return Principal(email="canvas_user", tenant_id="admin", is_admin=True)
-    
-    # TODO: Actually validate the JWT token using Chainlit's validation
-    # For now, presence of the token is enough (the HTML page already validated it)
-    return Principal(email="canvas_user", tenant_id="admin", is_admin=True)
+        log.warning("Canvas WebSocket: no access_token cookie - rejecting")
+        return None
+
+    try:
+        try:
+            from chainlit.auth import decode_jwt
+        except ImportError:
+            from chainlit.auth.jwt import decode_jwt
+
+        user = decode_jwt(token)
+        if inspect.isawaitable(user):
+            user = await user
+    except Exception as exc:
+        log.warning("Canvas WebSocket: could not decode session token (%s)", exc)
+        return None
+
+    principal = principal_of(user)
+    if principal is None:
+        log.warning("Canvas WebSocket: session token carried no usable principal")
+        return None
+
+    return principal
 
 
 @router.websocket("/session")
@@ -313,18 +328,22 @@ async def canvas_session(websocket: WebSocket):
     - {"type": "canvas.update", "tool": "<name>", "arguments": {...}, "result": {...}}
     - {"type": "error", "error": "<message>"}
     """
-    # Accept the WebSocket first
+    # Accept first, so we can send a readable reason before closing.
     await websocket.accept()
-    
-    # Get principal from cookies - but don't fail if we can't get it
-    # The page endpoint already requires auth, so if they got here, they're authenticated
-    try:
-        principal = await get_ws_principal(websocket)
-        log.info(f"Canvas WebSocket connected: {principal.email}")
-    except Exception as e:
-        log.warning(f"Canvas WebSocket auth warning: {e} - using default principal")
-        # Default to admin for now (the HTML page is already auth-gated)
-        principal = Principal(email="canvas_user", tenant_id="admin", is_admin=True)
+
+    principal = await get_ws_principal(websocket)
+    if principal is None:
+        await websocket.send_json({
+            "type": "error",
+            "error": "Not signed in. Reload the page, sign in, then open Canvas again.",
+        })
+        await websocket.close(code=4401)
+        return
+
+    log.info(
+        "Canvas WebSocket connected: %s (tenant=%s role=%s)",
+        principal.email, principal.tenant_id, principal.role,
+    )
     
     session = CanvasSession(websocket, principal)
     
