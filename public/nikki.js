@@ -484,11 +484,21 @@
     spk.style.cssText = css;
     paintSpeaker(spk);
     spk.addEventListener('click', function () {
-      localStorage.setItem('nikki-voice-enabled', voiceEnabled() ? 'false' : 'true');
+      var on = !voiceEnabled();
+      localStorage.setItem('nikki-voice-enabled', on ? 'true' : 'false');
+      if (!on) stopSpeaking();   // turning replies off also silences what is playing
       paintSpeaker(spk);
     });
 
-    wrap.appendChild(mic); wrap.appendChild(spk);
+    // Explicit stop: only visible while audio is actually playing.
+    var stopBtn = document.createElement("button");
+    stopBtn.id = 'nikki-stop-audio'; stopBtn.type = 'button';
+    stopBtn.style.cssText = css + ';display:none;border-color:#ff6b6b;color:#ff6b6b';
+    stopBtn.title = 'Stop speaking (Esc)';
+    stopBtn.innerHTML = ICON_STOP;
+    stopBtn.addEventListener('click', stopSpeaking);
+
+    wrap.appendChild(mic); wrap.appendChild(spk); wrap.appendChild(stopBtn);
     container.insertBefore(wrap, container.firstChild);
     observeMessages();
   }
@@ -510,6 +520,27 @@
     }).then(function (d) { return (d && d.text ? d.text : '').trim(); });
   }
 
+  var currentAudio = null;
+  var speakSeq = 0;
+
+  function setStopVisible(on) {
+    var b = document.getElementById('nikki-stop-audio');
+    if (b) b.style.display = on ? 'flex' : 'none';
+  }
+
+  // Single source of truth for stopping audio: cancels what is playing AND
+  // invalidates any TTS request still in flight, so a slow response cannot
+  // start a second voice after you already hit stop.
+  function stopSpeaking() {
+    speakSeq++;
+    if (currentAudio) {
+      try { currentAudio.pause(); } catch (e) {}
+      try { URL.revokeObjectURL(currentAudio.src); } catch (e) {}
+      currentAudio = null;
+    }
+    setStopVisible(false);
+  }
+
   function speak(text) {
     var clean = String(text || '')
       .replace(/```[\s\S]*?```/g, ' code block omitted. ')
@@ -518,6 +549,11 @@
       .replace(/^\s*[#>*\-]+\s*/gm, '')
       .replace(/\s+/g, ' ').trim().slice(0, 4000);
     if (!clean) return Promise.resolve();
+
+    // Never overlap: whatever is playing or pending loses to this call.
+    stopSpeaking();
+    var mine = speakSeq;
+
     var fd = new FormData();
     fd.append('text', clean);
     fd.append('voice', 'nova');
@@ -525,13 +561,22 @@
       if (!r.ok) throw new Error('speak returned ' + r.status);
       return r.blob();
     }).then(function (blob) {
+      if (mine !== speakSeq) return;   // superseded or stopped while fetching
       var url = URL.createObjectURL(blob);
       var audio = new Audio(url);
-      return audio.play().then(function () {
-        audio.onended = function () { URL.revokeObjectURL(url); };
-      });
+      currentAudio = audio;
+      setStopVisible(true);
+      audio.onended = audio.onerror = function () {
+        URL.revokeObjectURL(url);
+        if (currentAudio === audio) { currentAudio = null; setStopVisible(false); }
+      };
+      return audio.play();
     });
   }
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && currentAudio) stopSpeaking();
+  });
 
   function toggleRecording() {
     var mic = document.getElementById('nikki-mic-button');
@@ -573,6 +618,11 @@
   var primed = false;
   var messageObserver = null;
 
+  // A long thread paints one message at a time on load, and each newly painted
+  // message is briefly "the newest" - which fired one autoplay per message, all
+  // overlapping. Nothing autoplays until the page has settled.
+  setTimeout(function () { primed = true; }, 3000);
+
   function observeMessages() {
     if (messageObserver) return;
     messageObserver = new MutationObserver(function () {
@@ -606,7 +656,7 @@
           speak(text).catch(function (e) { console.warn('[nikki] autoplay blocked', e.message); });
         }
       }
-      primed = true;
+      // primed is set by the settle timer above, not here.
     });
     messageObserver.observe(document.body, { childList: true, subtree: true });
   }
