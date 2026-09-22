@@ -312,7 +312,7 @@ class TurnRenderer:
             if full_text:
                 self.msg.content = full_text
                 self.final_text.append(full_text)
-                await self.msg.send()
+                await self.msg.update()
             else:
                 await self.msg.remove()
             self.msg = None
