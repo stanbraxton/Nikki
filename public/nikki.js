@@ -257,6 +257,7 @@
         renderTranscript();
         break;
 
+      case 'response.output_audio.delta':
       case 'response.audio.delta':
         if (msg.delta) {
           setMode('speaking');
@@ -265,6 +266,8 @@
         }
         break;
 
+      case 'response.output_audio_transcript.delta':
+      case 'response.output_text.delta':
       case 'response.audio_transcript.delta':
       case 'response.text.delta':
         C.nikkiLine += (msg.delta || '');
