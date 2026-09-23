@@ -112,8 +112,10 @@ class ToolRegistry:
         if not admin:
             return list(out.values())
         self.refresh_skills()
-        for st in self._skills.values():
-            for t in st.tools:
+        # Sorted, not dict order: tool definitions are the very front of every request, so a
+        # skill hot-reload that reshuffled them would invalidate the whole prompt cache.
+        for _, st in sorted(self._skills.items()):
+            for t in sorted(st.tools, key=lambda t: t.name):
                 if t.name in out:
                     log.warning("skill tool %s shadows an existing tool; skipped", t.name)
                     continue
