@@ -64,10 +64,10 @@ async def run_prompt(prompt: str, thread_id: str, auto_approve: bool = False, mo
                 if isinstance(m, AIMessage):
                     usage.note(m, final=True)
 
-            stop = budget.stop_reason(usage.input_tokens, usage.output_tokens)
+            stop = budget.stop_reason(usage.input_tokens, usage.output_tokens, usage.cache_read, usage.cache_creation)
             if stop:
                 log.warning("headless run %s stopped by budget: %s", thread_id,
-                            budget.summary(usage.input_tokens, usage.output_tokens))
+                            budget.summary(usage.input_tokens, usage.output_tokens, usage.cache_read, usage.cache_creation))
                 await persistence.trace(thread_id, "budget_stop", {
                     "rounds": budget.rounds, "headless": True,
                     "input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens,
