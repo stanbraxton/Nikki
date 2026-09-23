@@ -99,7 +99,7 @@ async def daily_cap_message() -> str | None:
     if used < cap:
         return None
     return (
-        f"⚠️ **Problem:** today's token cap is used up ({used:,} of {cap:,} tokens since 00:00 UTC), "
+        f"⚠️ **Problem:** today's token cap is used up ({used:,} of {cap:,} cost-weighted tokens since 00:00 UTC), "
         "so I've stopped before spending more. This guard exists to catch runaway loops.\n\n"
         "**Possible solutions:**\n"
         "1. Wait until 00:00 UTC, when the cap resets.\n"

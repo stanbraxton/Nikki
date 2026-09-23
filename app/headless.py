@@ -69,6 +69,9 @@ async def run_prompt(prompt: str, thread_id: str, auto_approve: bool = False, mo
                 if isinstance(m, AIMessage):
                     usage.note(m, final=True)
 
+            if not state.next:
+                break  # finished: never report a completed run as budget-stopped
+
             stop = budget.stop_reason(usage.input_tokens, usage.output_tokens, usage.cache_read, usage.cache_creation)
             if stop:
                 log.warning("headless run %s stopped by budget: %s", thread_id,
@@ -80,8 +83,6 @@ async def run_prompt(prompt: str, thread_id: str, auto_approve: bool = False, mo
                 stopped = stop
                 break
 
-            if not state.next:
-                break
             calls = pending_tool_calls(state)
 
             repeats = [tc for tc in calls if budget.would_repeat(tc["name"], tc.get("args"))]

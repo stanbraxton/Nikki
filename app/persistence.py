@@ -573,14 +573,22 @@ async def trace(thread_id: str, kind: str, payload: Any) -> None:
 
 
 async def tokens_used_today() -> int:
-    """Tokens (input+output) this tenant has used since 00:00 UTC. 0 if the lookup fails."""
+    """Cost-weighted tokens this tenant has used since 00:00 UTC. 0 if the lookup fails.
+
+    Weighted like guards.TurnBudget.cost_weighted: cache reads count 0.1x and cache
+    writes 1.25x, so a day of well-cached turns is judged by what it cost, not by
+    how many times the same prefix was re-read.
+    """
     from sqlalchemy import func
 
     start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     try:
         async with engine().connect() as conn:
             v = (await conn.execute(
-                select(func.coalesce(func.sum(token_usage.c.total_tokens), 0))
+                select(func.coalesce(func.sum(
+                    token_usage.c.total_tokens
+                    - 0.9 * token_usage.c.cache_read_tokens
+                    + 0.25 * token_usage.c.cache_creation_tokens), 0))
                 .where(token_usage.c.tenant_id == _tenant_or_admin())
                 .where(token_usage.c.ts >= start))).scalar()
         return int(v or 0)

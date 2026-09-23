@@ -420,6 +420,13 @@ async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "Tu
         await stream_segment(graph, config, inp, r)
         await r.close_segment()
 
+        # A finished turn is finished, whatever the budget says. Checking the budget
+        # first appended "used all 16 tool rounds ... looping" to turns whose 16th
+        # round was the final answer (SmartTutor fix, 2026-09-23).
+        state = await graph.aget_state(config)
+        if not state.next:
+            break
+
         # Budget spent: stop cleanly rather than letting recursion_limit throw.
         stop = r.budget.stop_reason(r.input_tokens, r.output_tokens, r.usage.cache_read, r.usage.cache_creation)
         if stop:
@@ -434,9 +441,6 @@ async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "Tu
             _turn_budgets.pop(thread_id, None)
             return
 
-        state = await graph.aget_state(config)
-        if not state.next:
-            break
         calls = pending_tool_calls(state)
 
         # The same call, with the same arguments, for the third time. This is the
