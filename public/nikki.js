@@ -87,7 +87,11 @@
     var c = step.querySelector('.message-content') || step;
     return (c.innerText || c.textContent || '').trim();
   }
-  function voiceEnabled() { return localStorage.getItem('nikki-voice-enabled') !== 'false'; }
+  // Spoken replies are opt-in: every autoplayed reply is a paid TTS call.
+  // New key on purpose, so browsers that saved 'true' under the old
+  // 'nikki-voice-enabled' key start OFF too.
+  var VOICE_KEY = 'nikki-voice-autoplay';
+  function voiceEnabled() { return localStorage.getItem(VOICE_KEY) === 'true'; }
 
   // =====================================================================
   //  CANVAS - realtime voice
@@ -485,7 +489,7 @@
     paintSpeaker(spk);
     spk.addEventListener('click', function () {
       var on = !voiceEnabled();
-      localStorage.setItem('nikki-voice-enabled', on ? 'true' : 'false');
+      localStorage.setItem(VOICE_KEY, on ? 'true' : 'false');
       if (!on) stopSpeaking();   // turning replies off also silences what is playing
       paintSpeaker(spk);
     });
@@ -541,7 +545,7 @@
     setStopVisible(false);
   }
 
-  function speak(text) {
+  function speak(text, source) {
     var clean = String(text || '')
       .replace(/```[\s\S]*?```/g, ' code block omitted. ')
       .replace(/`([^`]+)`/g, '$1')
@@ -557,6 +561,7 @@
     var fd = new FormData();
     fd.append('text', clean);
     fd.append('voice', 'nova');
+    fd.append('source', source || 'manual');
     return fetch(TTS_URL, { method: 'POST', body: fd }).then(function (r) {
       if (!r.ok) throw new Error('speak returned ' + r.status);
       return r.blob();
@@ -653,7 +658,7 @@
         // Autoplay the newest reply only, and never on the first pass, so the
         // whole backlog is not read aloud on page load.
         if (i === steps.length - 1 && primed && voiceEnabled() && !C.open) {
-          speak(text).catch(function (e) { console.warn('[nikki] autoplay blocked', e.message); });
+          speak(text, 'autoplay').catch(function (e) { console.warn('[nikki] autoplay blocked', e.message); });
         }
       }
       // primed is set by the settle timer above, not here.
