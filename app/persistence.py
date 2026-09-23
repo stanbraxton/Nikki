@@ -186,6 +186,9 @@ token_usage = Table(  # track LLM token consumption per conversation turn
     Column("input_tokens", Integer, nullable=False, default=0),
     Column("output_tokens", Integer, nullable=False, default=0),
     Column("total_tokens", Integer, nullable=False, default=0),
+    # Subsets of input_tokens, so /turns and usage reports can tell whether caching works.
+    Column("cache_read_tokens", Integer, nullable=False, default=0, server_default="0"),
+    Column("cache_creation_tokens", Integer, nullable=False, default=0, server_default="0"),
 )
 
 # An approval is a durable authorization for exactly one paused graph checkpoint.
@@ -326,6 +329,8 @@ def _migrate(conn) -> None:
         "memories": {"tenant_id": "VARCHAR(64) NOT NULL DEFAULT 'admin'"},
         "schedules": {"tenant_id": "VARCHAR(64) NOT NULL DEFAULT 'admin'", "label": "VARCHAR(60) NOT NULL DEFAULT ''"},
         "scheduled_runs": {"tenant_id": "VARCHAR(64) NOT NULL DEFAULT 'admin'"},
+        "token_usage": {"cache_read_tokens": "INTEGER NOT NULL DEFAULT 0",
+                        "cache_creation_tokens": "INTEGER NOT NULL DEFAULT 0"},
     }
     for table, cols in wanted.items():
         if not insp.has_table(table):
@@ -567,7 +572,25 @@ async def trace(thread_id: str, kind: str, payload: Any) -> None:
         log.exception("trace write failed")
 
 
-async def log_token_usage(thread_id: str, model: str, input_tokens: int, output_tokens: int) -> None:
+async def tokens_used_today() -> int:
+    """Tokens (input+output) this tenant has used since 00:00 UTC. 0 if the lookup fails."""
+    from sqlalchemy import func
+
+    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        async with engine().connect() as conn:
+            v = (await conn.execute(
+                select(func.coalesce(func.sum(token_usage.c.total_tokens), 0))
+                .where(token_usage.c.tenant_id == _tenant_or_admin())
+                .where(token_usage.c.ts >= start))).scalar()
+        return int(v or 0)
+    except Exception:  # noqa: BLE001 - a failed lookup must never block a turn
+        log.exception("daily token lookup failed")
+        return 0
+
+
+async def log_token_usage(thread_id: str, model: str, input_tokens: int, output_tokens: int,
+                          cache_read: int = 0, cache_creation: int = 0) -> None:
     """Record token usage for a conversation turn."""
     import uuid
 
@@ -583,6 +606,8 @@ async def log_token_usage(thread_id: str, model: str, input_tokens: int, output_
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     total_tokens=input_tokens + output_tokens,
+                    cache_read_tokens=cache_read,
+                    cache_creation_tokens=cache_creation,
                 )
             )
     except Exception:  # noqa: BLE001 — token tracking must never break a turn

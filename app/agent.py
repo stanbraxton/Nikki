@@ -121,6 +121,22 @@ def route_model(user_text: str, recent_tools: set[str] | None = None) -> str | N
         return settings.engineer_model
     return None
 
+
+def route_light_model(user_text: str, recent_tools: set[str] | None = None,
+                      has_attachments: bool = False) -> str | None:
+    """NIKKI_LIGHT_MODEL for a short, plain conversational turn; None otherwise (off by default)."""
+    if not settings.light_model or has_attachments:
+        return None
+    t = (user_text or "").strip()
+    if not t or len(t) > settings.light_model_max_chars:
+        return None
+    if recent_tools and recent_tools & ENGINEER_TOOLS:
+        return None
+    if any(h in t.lower() for h in _ENGINEER_HINTS):
+        return None
+    log.info("route_light_model -> %s (short conversational turn, %d chars)", settings.light_model, len(t))
+    return settings.light_model
+
 _BILLING_MARKERS = ("credit balance is too low", "insufficient_quota", "billing_hard_limit_reached", "exceeded your current quota")
 
 
@@ -355,7 +371,12 @@ def system_prompt_parts() -> tuple[str, str]:
         "Whenever you encounter an error (a failed tool call, an API refusal, missing access), never just report "
         "the raw error: state the problem in plain words, list the possible solutions, and give your recommendation."
     )
-    volatile = f"{who}\nCurrent date/time: {datetime.now(timezone.utc):%A %Y-%m-%d %H:%M} UTC.\n\n{memory_block}".strip()
+    # Date only. This block sits in front of the whole conversation, so anything that changes
+    # here invalidates the prompt cache for every message after it. It used to carry HH:MM,
+    # which changed every minute: no user turn could ever read the previous turn's cached
+    # history, and each one paid full price for all of it. The clock now rides on the
+    # latest user message instead (see stamp_latest_user_message).
+    volatile = f"{who}\nToday's date: {datetime.now(timezone.utc):%A %Y-%m-%d} (UTC).\n\n{memory_block}".strip()
     return stable, volatile
 
 
@@ -427,20 +448,41 @@ def trim_history(messages: list[Any], budget_tokens: int | None = None) -> list[
     Always keeps the most recent user turn and everything after it. Cuts only at a
     HumanMessage boundary so tool_use/tool_result pairs are never split. The stored
     checkpoint is untouched; only the messages sent to the model are trimmed.
+
+    Cache-stable: the cut may only land on a fixed set of "checkpoints" - the first user
+    turn after every `budget // 2` tokens of history, measured from the START of the
+    thread. Those positions never move as the thread grows, so the cut stays put for
+    many turns and the prompt cache keeps hitting. The previous version moved the cut
+    by one turn on every message once a thread was over budget, which changed the very
+    first message sent and turned every turn of a long thread into a full-price cache miss.
     """
     budget = budget_tokens or settings.history_budget_tokens
-    total = sum(_approx_tokens(m) for m in messages)
+    sizes = [_approx_tokens(m) for m in messages]
+    total = sum(sizes)
     if total <= budget:
         return messages
     human_idx = [i for i, m in enumerate(messages) if isinstance(m, HumanMessage)]
-    cut = 0
-    for i in human_idx[1:]:
-        if total <= budget:
-            break
-        total -= sum(_approx_tokens(m) for m in messages[cut:i])
-        cut = i
+    last_human = human_idx[-1] if human_idx else 0
+    step = max(budget // 2, 1)
+    checkpoints: list[int] = []
+    running, next_mark = 0, step
+    for i, m in enumerate(messages):
+        if running >= next_mark and isinstance(m, HumanMessage):
+            checkpoints.append(i)
+            while next_mark <= running:
+                next_mark += step
+        running += sizes[i]
+    usable = [c for c in checkpoints if c <= last_human]
+    cut = next((c for c in usable if sum(sizes[c:]) <= budget), None)
+    if cut is None:
+        # No checkpoint gets under budget (e.g. one enormous recent turn): fall back to
+        # dropping whole turns one at a time, as before.
+        cut = usable[-1] if usable else 0
+        for i in human_idx[1:]:
+            if i > cut and sum(sizes[cut:]) > budget:
+                cut = i
     if cut:
-        log.info("trimmed history: dropped %d messages, ~%d tokens remain", cut, total)
+        log.info("trimmed history: dropped %d messages, ~%d tokens remain", cut, sum(sizes[cut:]))
     return messages[cut:]
 
 
@@ -479,9 +521,52 @@ def mark_cache_breakpoint(messages: list[Any]) -> list[Any]:
     return [*messages[:-1], last.model_copy(update={"content": blocks})]
 
 
+_STAMPS: dict[str, str] = {}
+
+
+def stamp_latest_user_message(messages: list[Any]) -> list[Any]:
+    """Prefix user messages (copies) with the UTC time they were first sent to the model.
+
+    The clock used to live in the system prompt, where it broke the prompt cache every
+    minute. Now the latest user message gets a stamp when first seen, and the stamp is
+    remembered per message id and re-applied on every later call - so each request is a
+    byte-identical extension of the previous one and the cache keeps hitting across tool
+    rounds, approvals and later turns. Older messages this process never stamped (e.g.
+    after a restart) are left alone rather than given a made-up time.
+    """
+    from datetime import datetime, timezone
+
+    last = next((i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], HumanMessage)), None)
+    if last is None:
+        return messages
+    out = list(messages)
+    for i, m in enumerate(messages):
+        if not isinstance(m, HumanMessage):
+            continue
+        key = getattr(m, "id", None)
+        stamp = _STAMPS.get(key) if key else None
+        if stamp is None and i == last:
+            if len(_STAMPS) > 20000:
+                _STAMPS.clear()
+            stamp = f"[Current time: {datetime.now(timezone.utc):%A %Y-%m-%d %H:%M} UTC]"
+            if key:
+                _STAMPS[key] = stamp
+        if stamp is None:
+            continue
+        content = m.content
+        if isinstance(content, str):
+            content = f"{stamp}\n{content}"
+        elif isinstance(content, list):
+            content = [{"type": "text", "text": stamp}, *content]
+        else:
+            continue
+        out[i] = m.model_copy(update={"content": content})
+    return out
+
+
 def _prepare_messages(msgs: list[Any], anthropic: bool) -> list[Any]:
     budget = settings.history_budget_tokens_anthropic if anthropic else settings.history_budget_tokens
-    out = compact_old_tool_results(trim_history(repair_history(list(msgs)), budget))
+    out = stamp_latest_user_message(compact_old_tool_results(trim_history(repair_history(list(msgs)), budget)))
     return mark_cache_breakpoint(out) if anthropic else out
 
 

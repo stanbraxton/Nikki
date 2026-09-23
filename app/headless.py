@@ -11,7 +11,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from app import persistence
 from app.agent import build_graph, fallback_model_for, is_billing_error, pending_tool_calls, rejection_messages, route_model, text_of
 from app.config import settings
-from app.guards import TurnBudget, UsageMeter, calls_model_next
+from app.guards import TurnBudget, UsageMeter, calls_model_next, daily_cap_message
 from app.tools import registry
 
 log = logging.getLogger("nikki.headless")
@@ -31,6 +31,11 @@ async def run_prompt(prompt: str, thread_id: str, auto_approve: bool = False, mo
         max_repeats=settings.max_repeated_tool_calls,
         token_ceiling=settings.turn_token_ceiling,
     )
+    # Unattended runs are exactly where a runaway day comes from, so they check the daily cap too.
+    cap_stop = await daily_cap_message()
+    if cap_stop:
+        await persistence.trace(thread_id, "budget_stop", {"reason": "daily_token_cap", "headless": True})
+        return cap_stop
     usage = UsageMeter()
     stopped: str | None = None
     await persistence.trace(thread_id, "user", {"text": prompt, "model": model or settings.model, "headless": True})
@@ -114,6 +119,7 @@ async def run_prompt(prompt: str, thread_id: str, auto_approve: bool = False, mo
     if stopped:
         final = (final + "\n\n" + stopped).strip() if final else stopped
     if usage.total_tokens:
-        await persistence.log_token_usage(thread_id, model or settings.model, usage.input_tokens, usage.output_tokens)
+        await persistence.log_token_usage(thread_id, model or settings.model, usage.input_tokens, usage.output_tokens,
+                                          usage.cache_read, usage.cache_creation)
     await persistence.trace(thread_id, "assistant", {"text": final[:8000], "headless": True})
     return final
