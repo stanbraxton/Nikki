@@ -13,7 +13,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Too
 
 from app import persistence
 from app.agent import build_graph, fallback_model_for, friendly_error, is_billing_error, pending_tool_calls, rejection_messages, route_model, text_of
-from app.guards import TurnBudget, UsageMeter
+from app.guards import TurnBudget, UsageMeter, calls_model_next
 from app.tools.artifacts import FILE_MARK, marks_in
 from app.tools.images import IMAGE_MARK
 from app.config import settings
@@ -415,7 +415,8 @@ async def on_message(message: cl.Message) -> None:
 async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "TurnRenderer", thread_id: str, preapproved: bool | None = None) -> None:
     """Run one turn until complete or until an approval checkpoint is rendered."""
     while True:
-        r.budget.start_round()
+        if await calls_model_next(graph, config, inp):
+            r.budget.start_round()
         await stream_segment(graph, config, inp, r)
         await r.close_segment()
 
