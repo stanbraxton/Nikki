@@ -12,8 +12,8 @@ from chainlit.input_widget import Select
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
 from app import persistence
-from app.agent import build_graph, fallback_model_for, friendly_error, is_billing_error, pending_tool_calls, rejection_messages, route_model, text_of
-from app.guards import TurnBudget, UsageMeter, calls_model_next
+from app.agent import build_graph, fallback_model_for, friendly_error, is_billing_error, pending_tool_calls, rejection_messages, route_light_model, route_model, text_of
+from app.guards import TurnBudget, UsageMeter, calls_model_next, daily_cap_message
 from app.tools.artifacts import FILE_MARK, marks_in
 from app.tools.images import IMAGE_MARK
 from app.config import settings
@@ -420,6 +420,13 @@ async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "Tu
         await stream_segment(graph, config, inp, r)
         await r.close_segment()
 
+        # A finished turn is finished, whatever the budget says. Checking the budget
+        # first appended "used all 16 tool rounds ... looping" to turns whose 16th
+        # round was the final answer (SmartTutor fix, 2026-09-23).
+        state = await graph.aget_state(config)
+        if not state.next:
+            break
+
         # Budget spent: stop cleanly rather than letting recursion_limit throw.
         stop = r.budget.stop_reason(r.input_tokens, r.output_tokens, r.usage.cache_read, r.usage.cache_creation)
         if stop:
@@ -434,9 +441,6 @@ async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "Tu
             _turn_budgets.pop(thread_id, None)
             return
 
-        state = await graph.aget_state(config)
-        if not state.next:
-            break
         calls = pending_tool_calls(state)
 
         # The same call, with the same arguments, for the third time. This is the
@@ -562,7 +566,8 @@ async def _continue_approval(thread_id: str, approved: bool, approval_id: str | 
             _turn_locks.pop(thread_id, None)
         reset_principal(principal_token)
     if r.input_tokens > 0 or r.output_tokens > 0:
-        await persistence.log_token_usage(thread_id, model, r.input_tokens, r.output_tokens)
+        await persistence.log_token_usage(thread_id, model, r.input_tokens, r.output_tokens,
+                                          r.usage.cache_read, r.usage.cache_creation)
     return True
 
 
@@ -591,6 +596,12 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
     r = TurnRenderer(thread_id)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.recursion_limit}
 
+    stop = await daily_cap_message()
+    if stop:
+        await persistence.trace(thread_id, "budget_stop", {"reason": "daily_token_cap"})
+        await cl.Message(content=stop).send()
+        return
+
     # Handle file attachments: save each one into the workspace (uploads/) so tools can act on it,
     # and inline a text rendering (PDF/DOCX/XLSX/PPTX/CSV text, image transcription, audio transcript).
     user_content = message.content
@@ -603,6 +614,11 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
     if routed and (cl.user_session.get("model") or settings.model) == settings.model:
         model = routed
         await persistence.trace(thread_id, "model_routed", {"to": routed})
+    elif not routed and (cl.user_session.get("model") or settings.model) == settings.model:
+        light = route_light_model(message.content, cl.user_session.get("recent_tools"), bool(message.elements))
+        if light:
+            model = light
+            await persistence.trace(thread_id, "model_routed", {"to": light, "reason": "light"})
 
     try:
         async with persistence.checkpointer() as cp:
@@ -650,4 +666,5 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
     
     # Log token usage for this turn
     if r.input_tokens > 0 or r.output_tokens > 0:
-        await persistence.log_token_usage(thread_id, model, r.input_tokens, r.output_tokens)
+        await persistence.log_token_usage(thread_id, model, r.input_tokens, r.output_tokens,
+                                          r.usage.cache_read, r.usage.cache_creation)

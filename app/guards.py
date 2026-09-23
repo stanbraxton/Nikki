@@ -87,6 +87,28 @@ class UsageMeter:
         return True
 
 
+async def daily_cap_message() -> str | None:
+    """The stop message if today's token cap is already spent, else None."""
+    from app import persistence
+    from app.config import settings
+
+    cap = settings.daily_token_cap
+    if cap <= 0:
+        return None
+    used = await persistence.tokens_used_today()
+    if used < cap:
+        return None
+    return (
+        f"⚠️ **Problem:** today's token cap is used up ({used:,} of {cap:,} cost-weighted tokens since 00:00 UTC), "
+        "so I've stopped before spending more. This guard exists to catch runaway loops.\n\n"
+        "**Possible solutions:**\n"
+        "1. Wait until 00:00 UTC, when the cap resets.\n"
+        "2. Raise `NIKKI_DAILY_TOKEN_CAP` on the Cloud Run service (0 turns it off).\n"
+        "3. Check /turns for what used the tokens today.\n\n"
+        "**Recommendation:** option 3 first — a day this heavy is usually a loop, not real work."
+    )
+
+
 async def calls_model_next(graph: Any, config: dict, inp: Any) -> bool:
     """True when the next graph segment will make a model call (i.e. is a real tool round).
 

@@ -42,7 +42,12 @@ class Settings:
     # invalidates the Anthropic prompt cache from that point on - paying full price for less
     # context. trim_history runs first, so this only ever shrinks a history already inside budget.
     old_tool_result_chars: int = int(_env("NIKKI_OLD_TOOL_RESULT_CHARS", "6000"))
-    max_tokens: int = int(_env("NIKKI_MAX_TOKENS", "8192"))
+    # Output cap per model call, thinking included on adaptive models. Was 8192: a
+    # repo_write of a generated file (e.g. SmartTutor seed curriculum, 2026-09-23) ran
+    # past it, the tool call was cut off mid-argument, and the model saw "content
+    # missing" and retried the same oversized write again and again. You pay only for
+    # tokens actually generated, so a higher cap costs nothing on ordinary turns.
+    max_tokens: int = int(_env("NIKKI_MAX_TOKENS", "32000"))
     # Graph-level step cap. Was 40 - higher than LangGraph's own default of 25,
     # so a looping turn ran nearly twice as long before anything stopped it.
     recursion_limit: int = int(_env("NIKKI_RECURSION_LIMIT", "18"))
@@ -53,6 +58,11 @@ class Settings:
     max_repeated_tool_calls: int = int(_env("NIKKI_MAX_REPEATED_TOOL_CALLS", "2"))
     # Hard ceiling on input+output tokens for one turn. 0 disables.
     turn_token_ceiling: int = int(_env("NIKKI_TURN_TOKEN_CEILING", "400000"))
+    # Daily ceiling on tokens (input+output) per tenant, summed from token_usage since
+    # 00:00 UTC. The per-turn guards above stop one runaway turn; this stops a runaway
+    # DAY - many turns, or a schedule firing over and over (the 2026-09-19 incident burned
+    # ~39M tokens). A normal heavy day here is ~5-12M. 0 disables.
+    daily_token_cap: int = int(_env("NIKKI_DAILY_TOKEN_CAP", "20000000"))
     # Extended thinking budget, Anthropic only. 0 = off. Raises max_tokens when set.
     # On by default: the largest single lever on answer quality in this app. The UI has always
     # rendered thinking blocks (stream_segment handles them); the model was never asked for any.
@@ -69,6 +79,11 @@ class Settings:
     # their cost impact can be read on its own; stacking an Opus-class model on engineering
     # turns is a separate decision, made once there is a bill to compare against.
     engineer_model: str = _env("NIKKI_ENGINEER_MODEL", "anthropic:claude-sonnet-5") or ""
+    # Cheaper model for short, plain conversational turns (e.g. "anthropic:claude-haiku-4-5").
+    # Empty = off, the default: turn it on deliberately and compare /turns before and after.
+    # Never used for engineering turns, turns with attachments, or long messages.
+    light_model: str = _env("NIKKI_LIGHT_MODEL", "") or ""
+    light_model_max_chars: int = int(_env("NIKKI_LIGHT_MODEL_MAX_CHARS", "280"))
     # Persistence. Postgres in prod (postgresql://user:pw@/db?host=/cloudsql/...),
     # SQLite locally.
     database_url: str = _env("DATABASE_URL", f"sqlite:///{ROOT / 'data' / 'nikki.db'}")
