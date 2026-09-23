@@ -11,7 +11,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from app import persistence
 from app.agent import build_graph, fallback_model_for, is_billing_error, pending_tool_calls, rejection_messages, route_model, text_of
 from app.config import settings
-from app.guards import TurnBudget, UsageMeter
+from app.guards import TurnBudget, UsageMeter, calls_model_next
 from app.tools import registry
 
 log = logging.getLogger("nikki.headless")
@@ -41,7 +41,8 @@ async def run_prompt(prompt: str, thread_id: str, auto_approve: bool = False, mo
             await graph.aupdate_state(config, {"messages": rejection_messages(stale, "Superseded by a new run.")}, as_node="tools")
         inp: Any = {"messages": [HumanMessage(content=prompt)]}
         while True:
-            budget.start_round()
+            if await calls_model_next(graph, config, inp):
+                budget.start_round()
             try:
                 await graph.ainvoke(inp, config)
             except Exception as e:  # noqa: BLE001
