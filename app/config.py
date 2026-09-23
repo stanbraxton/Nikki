@@ -42,7 +42,12 @@ class Settings:
     # invalidates the Anthropic prompt cache from that point on - paying full price for less
     # context. trim_history runs first, so this only ever shrinks a history already inside budget.
     old_tool_result_chars: int = int(_env("NIKKI_OLD_TOOL_RESULT_CHARS", "6000"))
-    max_tokens: int = int(_env("NIKKI_MAX_TOKENS", "8192"))
+    # Output cap per model call, thinking included on adaptive models. Was 8192: a
+    # repo_write of a generated file (e.g. SmartTutor seed curriculum, 2026-09-23) ran
+    # past it, the tool call was cut off mid-argument, and the model saw "content
+    # missing" and retried the same oversized write again and again. You pay only for
+    # tokens actually generated, so a higher cap costs nothing on ordinary turns.
+    max_tokens: int = int(_env("NIKKI_MAX_TOKENS", "32000"))
     # Graph-level step cap. Was 40 - higher than LangGraph's own default of 25,
     # so a looping turn ran nearly twice as long before anything stopped it.
     recursion_limit: int = int(_env("NIKKI_RECURSION_LIMIT", "18"))
