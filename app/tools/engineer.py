@@ -229,7 +229,9 @@ def repo_search(repo: str, pattern: str, path_glob: str = "") -> str:
 @tool
 def repo_write(repo: str, path: str, content: str) -> str:
     """Create or overwrite a file in the local working tree of an opened repo (nothing is pushed until
-    repo_commit_push). Parent folders are created."""
+    repo_commit_push). Parent folders are created. Keep one call under ~40,000 characters: a larger
+    `content` can be cut off mid-call, which shows up as a missing-`content` error. If you get that
+    error, do NOT retry the same write - split the data across several smaller files instead."""
     try:
         p = _resolve(_repo_dir(repo), path)
         p.parent.mkdir(parents=True, exist_ok=True)
