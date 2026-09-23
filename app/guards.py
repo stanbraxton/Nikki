@@ -56,6 +56,11 @@ class UsageMeter:
 
     input_tokens: int = 0
     output_tokens: int = 0
+    # Subsets of input_tokens. langchain-anthropic folds cache reads/writes INTO
+    # input_tokens, but a cache read is billed at 0.1x. Kept separately so the
+    # token ceiling can judge real cost instead of raw volume.
+    cache_read: int = 0
+    cache_creation: int = 0
     seen: set[str] = field(default_factory=set)
 
     @property
@@ -76,6 +81,9 @@ class UsageMeter:
             return False
         self.input_tokens += usage.get("input_tokens") or 0
         self.output_tokens += usage.get("output_tokens") or 0
+        details = usage.get("input_token_details") or {}
+        self.cache_read += details.get("cache_read") or 0
+        self.cache_creation += details.get("cache_creation") or 0
         return True
 
 
@@ -120,6 +128,20 @@ class TurnBudget:
     def round_limit_hit(self) -> bool:
         return self.rounds >= self.max_tool_rounds
 
+    @staticmethod
+    def cost_weighted(input_tokens: int, output_tokens: int,
+                      cache_read: int = 0, cache_creation: int = 0) -> int:
+        """Tokens weighted by what they are billed at, in plain-input-token units.
+
+        Every tool round re-sends the whole conversation, but after the first call
+        that prefix comes from the prompt cache at 0.1x (writes cost 1.25x). Counting
+        cache reads at full price stopped ordinary multi-file engineering turns at
+        ~400k "tokens" that actually cost a fraction of that (golden-picks
+        Mismatch Hunter build, 2026-09-23: three turns in a row, each stopped).
+        """
+        plain = max(0, input_tokens - cache_read - cache_creation)
+        return int(plain + 0.1 * cache_read + 1.25 * cache_creation + output_tokens)
+
     def token_ceiling_hit(self, total_tokens: int) -> bool:
         return self.token_ceiling > 0 and total_tokens >= self.token_ceiling
 
@@ -144,19 +166,23 @@ class TurnBudget:
             "approach or ask the user how to proceed."
         )
 
-    def summary(self, input_tokens: int, output_tokens: int) -> str:
+    def summary(self, input_tokens: int, output_tokens: int,
+                cache_read: int = 0, cache_creation: int = 0) -> str:
         total = input_tokens + output_tokens
+        cost = self.cost_weighted(input_tokens, output_tokens, cache_read, cache_creation)
         return (
             f"{self.rounds} tool round(s), ~{total:,} tokens "
-            f"({input_tokens:,} in / {output_tokens:,} out)"
+            f"({input_tokens:,} in [{cache_read:,} cache read, {cache_creation:,} cache write] "
+            f"/ {output_tokens:,} out), ~{cost:,} cost-weighted"
         )
 
-    def stop_reason(self, input_tokens: int = 0, output_tokens: int = 0) -> str | None:
-        total = input_tokens + output_tokens
+    def stop_reason(self, input_tokens: int = 0, output_tokens: int = 0,
+                    cache_read: int = 0, cache_creation: int = 0) -> str | None:
+        total = self.cost_weighted(input_tokens, output_tokens, cache_read, cache_creation)
         if self.token_ceiling_hit(total):
             return (
                 f"⚠️ **Problem:** this turn hit its token ceiling ({total:,} of "
-                f"{self.token_ceiling:,}) and was stopped before it could cost more.\n\n"
+                f"{self.token_ceiling:,} cost-weighted) and was stopped before it could cost more.\n\n"
                 "**Possible solutions:**\n"
                 "1. Ask me for a smaller, more specific step.\n"
                 "2. Start a new thread if the history has grown large.\n"
