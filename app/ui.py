@@ -421,10 +421,10 @@ async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "Tu
         await r.close_segment()
 
         # Budget spent: stop cleanly rather than letting recursion_limit throw.
-        stop = r.budget.stop_reason(r.input_tokens, r.output_tokens)
+        stop = r.budget.stop_reason(r.input_tokens, r.output_tokens, r.usage.cache_read, r.usage.cache_creation)
         if stop:
             log.warning("turn %s stopped by budget: %s", thread_id,
-                        r.budget.summary(r.input_tokens, r.output_tokens))
+                        r.budget.summary(r.input_tokens, r.output_tokens, r.usage.cache_read, r.usage.cache_creation))
             await persistence.trace(thread_id, "budget_stop", {
                 "rounds": r.budget.rounds,
                 "input_tokens": r.input_tokens,
