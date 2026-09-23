@@ -79,6 +79,22 @@ class UsageMeter:
         return True
 
 
+async def calls_model_next(graph: Any, config: dict, inp: Any) -> bool:
+    """True when the next graph segment will make a model call (i.e. is a real tool round).
+
+    The graph pauses twice per round: interrupt_before=["tools"] (so calls can be
+    approved/blocked) and interrupt_after=["tools"] (so a hot-loaded skill can be
+    bound). The segment resumed from the before-tools pause only RUNS the tools and
+    stops again; it never calls the model. Counting every segment therefore charged
+    two rounds per tool batch, and NIKKI_MAX_TOOL_ROUNDS=16 fired after 8 real
+    rounds (thread b7399b70, 2026-09-23: 8 tool calls, "used all 16 rounds").
+    """
+    if inp is not None:
+        return True  # fresh input always goes to the model
+    state = await graph.aget_state(config)
+    return "tools" not in (state.next or ())
+
+
 @dataclass
 class TurnBudget:
     """Per-turn limits. One instance per user turn, carried through the tool loop.

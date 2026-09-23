@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from io import BytesIO
 from typing import Annotated
 
@@ -10,6 +11,11 @@ from fastapi.responses import StreamingResponse
 from openai import AsyncOpenAI
 
 log = logging.getLogger(__name__)
+
+# System-wide switch for auto-spoken chat replies. Off unless explicitly set,
+# because autoplay turns every reply into a paid TTS call. Manual "Play"
+# clicks are unaffected.
+VOICE_AUTOPLAY_ENABLED = os.getenv("VOICE_AUTOPLAY_ENABLED", "false").lower() in ("1", "true", "yes")
 
 router = APIRouter(prefix="/api/voice", tags=["voice"])
 
@@ -59,12 +65,15 @@ async def transcribe(
 async def speak(
     text: Annotated[str, Form()],
     voice: Annotated[str, Form()] = "nova",
+    source: Annotated[str, Form()] = "manual",
 ) -> StreamingResponse:
     """
     Convert text to speech using OpenAI TTS.
     Voices: alloy, echo, fable, onyx, nova, shimmer
     Returns MP3 audio stream.
     """
+    if source == "autoplay" and not VOICE_AUTOPLAY_ENABLED:
+        raise HTTPException(status_code=403, detail="Spoken replies are disabled")
     try:
         # Call OpenAI TTS API
         response = await client().audio.speech.create(
