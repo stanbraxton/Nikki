@@ -121,7 +121,7 @@ class CanvasSession:
     async def _configure_session(self):
         """Send initial configuration to OpenAI Realtime API."""
         # Get system instructions
-        instructions = system_prompt()
+        instructions = system_prompt("openai:gpt-realtime")  # voice runs on OpenAI Realtime, not the chat model
         
         # Convert tools to OpenAI function format
         tool_schemas = []
