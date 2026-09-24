@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Cookie, HTTPException, Depends
@@ -28,6 +29,24 @@ from app import persistence
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/canvas", tags=["canvas"])
+
+# --- Cost guardrails -------------------------------------------------------
+# Realtime bills by wall-clock audio, so an open mic with nobody talking costs
+# the same as a live conversation. A forgotten browser tab is a real bill.
+# Both caps are env-tunable; set either to 0 to disable it.
+MAX_SESSION_SECONDS = int(os.environ.get("CANVAS_MAX_SESSION_SECONDS", "900"))
+IDLE_SECONDS = int(os.environ.get("CANVAS_IDLE_SECONDS", "180"))
+_WATCHDOG_TICK_SECONDS = 5
+
+# Events that prove a human is still in the room. Client audio frames do NOT
+# count: the mic streams silence just as steadily as speech, so counting them
+# would defeat the idle timer entirely.
+_ACTIVITY_EVENTS = frozenset({
+    "input_audio_buffer.speech_started",
+    "input_audio_buffer.committed",
+    "conversation.item.input_audio_transcription.completed",
+    "response.done",
+})
 
 _client: AsyncOpenAI | None = None
 
@@ -50,10 +69,14 @@ class CanvasSession:
         self.session_id: str = ""
         self.running = False
         self.tools = registry.tools(admin=principal.is_admin)
+        self.started_at = 0.0
+        self.last_activity_at = 0.0
+        self.close_reason: str | None = None
         
     async def start(self):
         """Connect to OpenAI Realtime API and start bidirectional streaming."""
         self.running = True
+        self.started_at = self.last_activity_at = time.monotonic()
         
         # Create Realtime session
         # https://platform.openai.com/docs/api-reference/realtime
@@ -64,14 +87,13 @@ class CanvasSession:
             if not api_key:
                 raise ValueError("OPENAI_API_KEY not configured")
             
-            # Connect to OpenAI Realtime API (WSS)
-            uri = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17"
+            # Connect to OpenAI Realtime API (GA shape - beta retired May 2026)
+            uri = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
             headers = {
-                "Authorization": f"Bearer {api_key}",
-                "OpenAI-Beta": "realtime=v1"
+                "Authorization": f"Bearer {api_key}"
             }
             
-            self.openai_ws = await websockets.connect(uri, extra_headers=headers)
+            self.openai_ws = await websockets.connect(uri, additional_headers=headers)
             log.info(f"Canvas session started for {self.principal.email}")
             
             # Send session configuration
@@ -81,6 +103,7 @@ class CanvasSession:
             await asyncio.gather(
                 self._relay_client_to_openai(),
                 self._relay_openai_to_client(),
+                self._watchdog(),
                 return_exceptions=True
             )
             
@@ -103,7 +126,12 @@ class CanvasSession:
         # Convert tools to OpenAI function format
         tool_schemas = []
         for tool in self.tools:
-            schema = tool.get_input_schema()
+            model = tool.get_input_schema()
+            schema = (model.model_json_schema()
+                      if hasattr(model, "model_json_schema") else model.schema())
+            schema.pop("title", None)
+            schema.setdefault("type", "object")
+            schema.setdefault("properties", {})
             tool_schemas.append({
                 "type": "function",
                 "name": tool.name,
@@ -114,24 +142,29 @@ class CanvasSession:
         config = {
             "type": "session.update",
             "session": {
-                "modalities": ["text", "audio"],
+                "type": "realtime",
+                "model": "gpt-realtime",
                 "instructions": instructions,
-                "voice": "nova",
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": "whisper-1"
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500
+                "output_modalities": ["audio"],
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "transcription": {"model": "whisper-1"},
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 500
+                        }
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "voice": "nova"
+                    }
                 },
                 "tools": tool_schemas,
                 "tool_choice": "auto",
-                "temperature": 0.8,
-                "max_response_output_tokens": 4096
+                "max_output_tokens": 4096
             }
         }
         
@@ -153,6 +186,7 @@ class CanvasSession:
                         "audio": msg["audio"]
                     }))
                 elif msg.get("type") == "text":
+                    self.last_activity_at = time.monotonic()
                     # Text message (for canvas context or user typing)
                     await self.openai_ws.send(json.dumps({
                         "type": "conversation.item.create",
@@ -170,6 +204,7 @@ class CanvasSession:
                         "type": "response.create"
                     }))
                 elif msg.get("type") == "commit_audio":
+                    self.last_activity_at = time.monotonic()
                     # User stopped speaking, commit the audio buffer
                     await self.openai_ws.send(json.dumps({
                         "type": "input_audio_buffer.commit"
@@ -190,15 +225,26 @@ class CanvasSession:
             async for raw_msg in self.openai_ws:
                 msg = json.loads(raw_msg)
                 event_type = msg.get("type")
+
+                if event_type in _ACTIVITY_EVENTS:
+                    self.last_activity_at = time.monotonic()
                 
                 # Forward transcript and audio to client
                 if event_type in [
+                    # GA names (the beta event shape was retired in May 2026)
+                    "response.output_audio.delta",
+                    "response.output_audio.done",
+                    "response.output_audio_transcript.delta",
+                    "response.output_text.delta",
+                    "conversation.item.added",
+                    "conversation.item.done",
+                    # legacy beta names, kept so either shape still relays
                     "response.audio.delta",
                     "response.audio_transcript.delta",
                     "response.text.delta",
+                    "response.audio.done",
                     "conversation.item.created",
                     "response.done",
-                    "response.audio.done",
                     "input_audio_buffer.speech_started",
                     "input_audio_buffer.speech_stopped",
                     "input_audio_buffer.committed",
@@ -218,6 +264,62 @@ class CanvasSession:
         except Exception as e:
             log.error(f"OpenAI relay error: {e}")
     
+    async def _watchdog(self):
+        """Hang up on sessions that run too long or go quiet.
+
+        Without this a Canvas tab left open bills for its entire lifetime,
+        which is how a voice feature quietly drains an API balance.
+        """
+        try:
+            while self.running:
+                await asyncio.sleep(_WATCHDOG_TICK_SECONDS)
+                if not self.running:
+                    return
+                now = time.monotonic()
+
+                if MAX_SESSION_SECONDS and now - self.started_at >= MAX_SESSION_SECONDS:
+                    await self._close_with_reason(
+                        "session_limit",
+                        f"Voice session ended after {MAX_SESSION_SECONDS // 60} minutes. "
+                        "Open Canvas again to keep going.",
+                    )
+                    return
+
+                if IDLE_SECONDS and now - self.last_activity_at >= IDLE_SECONDS:
+                    await self._close_with_reason(
+                        "idle_timeout",
+                        f"Voice session ended after {IDLE_SECONDS // 60} minutes of silence.",
+                    )
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error(f"Canvas watchdog error: {e}")
+
+    async def _close_with_reason(self, reason: str, message: str):
+        """Tell the client why we are hanging up, then tear both sockets down."""
+        self.running = False
+        self.close_reason = reason
+        log.info(
+            "Canvas session closed (%s) for %s after %.0fs",
+            reason, self.principal.email, time.monotonic() - self.started_at,
+        )
+        try:
+            await self.user_ws.send_json({
+                "type": "session.closed",
+                "reason": reason,
+                "message": message,
+            })
+        except Exception:
+            pass
+        for sock in (self.openai_ws, self.user_ws):
+            if sock is None:
+                continue
+            try:
+                await sock.close()
+            except Exception:
+                pass
+
     async def _execute_tool_call(self, msg: dict):
         """Execute a tool call and send results back to OpenAI + canvas update to client."""
         try:
@@ -275,27 +377,42 @@ class CanvasSession:
             })
 
 
-async def get_ws_principal(websocket: WebSocket) -> Principal:
-    """Extract principal from WebSocket cookies (same auth as Chainlit)."""
-    from chainlit.auth import get_current_user
+async def get_ws_principal(websocket: WebSocket) -> Principal | None:
+    """Authenticate a Canvas WebSocket with the same session cookie the UI uses.
+
+    Returns None when the caller is not signed in; the caller MUST then close
+    the socket. There is deliberately no anonymous fallback: this endpoint
+    exposes the full tool set over voice, including the admin-only file, SQL
+    and self-maintenance tools.
+    """
+    import inspect
+
     from app.auth import principal_of
-    
-    # Get cookies from WebSocket
-    cookies = websocket.cookies
-    
-    # Chainlit JWT token is in the 'access_token' cookie
-    token = cookies.get("access_token")
+
+    token = websocket.cookies.get("access_token")
     if not token:
-        # Fall back to checking for chainlit-* cookies (session tokens)
-        # For now, if the user can load the page, they're authenticated
-        # This is safe: the HTML page itself requires auth to load
-        # We just accept any WebSocket connection that made it this far
-        log.warning("Canvas WebSocket: no access_token cookie, allowing connection (page already auth-gated)")
-        return Principal(email="canvas_user", tenant_id="admin", is_admin=True)
-    
-    # TODO: Actually validate the JWT token using Chainlit's validation
-    # For now, presence of the token is enough (the HTML page already validated it)
-    return Principal(email="canvas_user", tenant_id="admin", is_admin=True)
+        log.warning("Canvas WebSocket: no access_token cookie - rejecting")
+        return None
+
+    try:
+        try:
+            from chainlit.auth import decode_jwt
+        except ImportError:
+            from chainlit.auth.jwt import decode_jwt
+
+        user = decode_jwt(token)
+        if inspect.isawaitable(user):
+            user = await user
+    except Exception as exc:
+        log.warning("Canvas WebSocket: could not decode session token (%s)", exc)
+        return None
+
+    principal = principal_of(user)
+    if principal is None:
+        log.warning("Canvas WebSocket: session token carried no usable principal")
+        return None
+
+    return principal
 
 
 @router.websocket("/session")
@@ -313,18 +430,22 @@ async def canvas_session(websocket: WebSocket):
     - {"type": "canvas.update", "tool": "<name>", "arguments": {...}, "result": {...}}
     - {"type": "error", "error": "<message>"}
     """
-    # Accept the WebSocket first
+    # Accept first, so we can send a readable reason before closing.
     await websocket.accept()
-    
-    # Get principal from cookies - but don't fail if we can't get it
-    # The page endpoint already requires auth, so if they got here, they're authenticated
-    try:
-        principal = await get_ws_principal(websocket)
-        log.info(f"Canvas WebSocket connected: {principal.email}")
-    except Exception as e:
-        log.warning(f"Canvas WebSocket auth warning: {e} - using default principal")
-        # Default to admin for now (the HTML page is already auth-gated)
-        principal = Principal(email="canvas_user", tenant_id="admin", is_admin=True)
+
+    principal = await get_ws_principal(websocket)
+    if principal is None:
+        await websocket.send_json({
+            "type": "error",
+            "error": "Not signed in. Reload the page, sign in, then open Canvas again.",
+        })
+        await websocket.close(code=4401)
+        return
+
+    log.info(
+        "Canvas WebSocket connected: %s (tenant=%s role=%s)",
+        principal.email, principal.tenant_id, principal.role,
+    )
     
     session = CanvasSession(websocket, principal)
     

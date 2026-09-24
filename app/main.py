@@ -15,6 +15,7 @@ from app.integrations.routes import router as integrations_router
 from app.legal import router as legal_router
 from app.scheduler import router as scheduler_router
 from app.spaces_gallery import router as spaces_router
+from app.turns import router as turns_router
 from app.voice import router as voice_router
 from app.config import ROOT, settings
 from app.tools import registry
@@ -68,7 +69,25 @@ async def skills() -> list[dict]:
     return registry.skill_report()
 
 
+@app.get("/api/kb/{name}", dependencies=[Depends(_admin)])
+async def kb_file(name: str):
+    """Serve a knowledge base file (admin-only temporary endpoint for large payload delivery)."""
+    from pathlib import Path
+    from fastapi.responses import FileResponse
+    
+    kb_path = Path("/mnt/data/knowledge") / f"{name}.md"
+    if not kb_path.exists():
+        # Try repo knowledge/
+        kb_path = ROOT / "knowledge" / f"{name}.md"
+    
+    if not kb_path.exists():
+        raise HTTPException(status_code=404, detail=f"KB file {name} not found")
+    
+    return FileResponse(kb_path, media_type="text/markdown", filename=f"{name}.md")
+
+
 app.include_router(spaces_router)
+app.include_router(turns_router)
 app.include_router(auth_router)
 app.include_router(canvas_router)
 app.include_router(integrations_router)

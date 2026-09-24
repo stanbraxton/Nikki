@@ -30,6 +30,7 @@ from langchain_core.tools import tool
 from sqlalchemy import delete, insert, select, update
 
 from app import persistence
+from app.guards import convex_lint_tree
 
 log = logging.getLogger("nikki.engineer")
 
@@ -228,7 +229,9 @@ def repo_search(repo: str, pattern: str, path_glob: str = "") -> str:
 @tool
 def repo_write(repo: str, path: str, content: str) -> str:
     """Create or overwrite a file in the local working tree of an opened repo (nothing is pushed until
-    repo_commit_push). Parent folders are created."""
+    repo_commit_push). Parent folders are created. Keep one call under ~40,000 characters: a larger
+    `content` can be cut off mid-call, which shows up as a missing-`content` error. If you get that
+    error, do NOT retry the same write - split the data across several smaller files instead."""
     try:
         p = _resolve(_repo_dir(repo), path)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -272,11 +275,70 @@ def repo_git(repo: str, command: str) -> str:
         return f"error: {e}"
 
 
+def _convex_sources(path: Path, only: list[str] | None = None) -> dict[str, str]:
+    """{relative path: source} for convex/*.ts, plus schema.ts so the lint can check columns."""
+    out: dict[str, str] = {}
+    cdir = path / "convex"
+    if not cdir.is_dir():
+        return out
+    for fp in cdir.rglob("*.ts"):
+        if "_generated" in fp.parts or "node_modules" in fp.parts:
+            continue
+        rel = str(fp.relative_to(path))
+        if only is not None and rel not in only and not rel.endswith("convex/schema.ts"):
+            continue
+        try:
+            out[rel] = fp.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+    return out
+
+
+def _convex_gate(path: Path) -> str | None:
+    """Refusal message if the staged convex/ files carry a known build breaker, else None."""
+    staged = [ln for ln in _git(path, "diff", "--cached", "--name-only", check=False).splitlines()
+              if ln.startswith("convex/") and ln.endswith((".ts", ".tsx"))]
+    if not staged:
+        return None
+    findings = convex_lint_tree(_convex_sources(path, only=staged))
+    findings = [f for f in findings if f.path in staged]
+    if not findings:
+        return None
+    lines = "\n".join(f"  {f}" for f in findings[:20])
+    return ("BLOCKED before push — these will fail `tsc -b` on Cloud Build:\n\n"
+            f"{lines}\n\n"
+            "Fix them and push again. A failed Cloud Build costs several minutes and a full "
+            "container build; this check costs nothing. If you are certain a finding is wrong, "
+            "call repo_commit_push again with force=True and say why.")
+
+
+@tool
+def repo_check(repo: str) -> str:
+    """Static check of an opened repo's convex/ files for the two known build-breaking TypeScript
+    patterns, using its own schema.ts to tell required columns from optional ones. Read-only, instant,
+    no approval. Run it after editing anything under convex/ and before proposing a push — it costs
+    nothing, and a failed Cloud Build costs minutes."""
+    try:
+        path = _repo_dir(repo)
+        sources = _convex_sources(path)
+        if not sources:
+            return "(no convex/ directory — nothing to check)"
+        findings = convex_lint_tree(sources)
+        if not findings:
+            return f"checked {len(sources)} convex file(s) — no known build-breaking patterns found"
+        return (f"checked {len(sources)} file(s), {len(findings)} finding(s):\n"
+                + "\n".join(str(f) for f in findings))
+    except Exception as e:  # noqa: BLE001
+        return f"error: {e}"
+
+
 # ------------------------------------------------------------------ gated repo tools
 @tool
-def repo_commit_push(repo: str, message: str, branch: str = "") -> str:
+def repo_commit_push(repo: str, message: str, branch: str = "", force: bool = False) -> str:
     """Stage all changes, commit as Nikki and push to GitHub. Requires approval. `branch` defaults to the
-    current branch; a new branch name is created and pushed with upstream tracking."""
+    current branch; a new branch name is created and pushed with upstream tracking. Staged convex/ files
+    are checked first for the two known build-breaking TypeScript patterns; `force=True` skips that check
+    and must be justified out loud."""
     try:
         path = _repo_dir(repo)
         if not github_token():
@@ -287,6 +349,10 @@ def repo_commit_push(repo: str, message: str, branch: str = "") -> str:
         _git(path, "add", "-A")
         if not _git(path, "status", "--porcelain", check=False):
             return "nothing to commit"
+        if not force:
+            blocked = _convex_gate(path)
+            if blocked:
+                return blocked
         _git(path, "commit", "-m", message)
         out = _git(path, "push", "-u", "origin", cur, timeout=300)
         sha = _git(path, "rev-parse", "--short", "HEAD")
@@ -1014,12 +1080,12 @@ def list_convex_env(slug: str) -> str:
     return ", ".join(sorted(env)) if env else "(none)"
 
 
-TOOLS = [repo_open, repo_list, repo_read, repo_search, repo_write, repo_edit, repo_git,
+TOOLS = [repo_open, repo_list, repo_read, repo_search, repo_write, repo_edit, repo_git, repo_check,
          repo_commit_push, github_create_repo, repo_run,
          scaffold_app, set_convex_env, list_convex_env,
          register_app, deploy_app, deploy_self, app_status, build_log, list_apps, add_custom_domain, delete_app]
-for _t in (repo_open, repo_list, repo_read, repo_search, repo_write, repo_edit, repo_git, app_status, build_log, list_apps,
-           list_convex_env):
+for _t in (repo_open, repo_list, repo_read, repo_search, repo_write, repo_edit, repo_git, repo_check,
+           app_status, build_log, list_apps, list_convex_env):
     _t.metadata = {"requires_approval": False}
 for _t in (repo_commit_push, github_create_repo, repo_run, scaffold_app, set_convex_env, register_app, deploy_app,
            deploy_self, add_custom_domain, delete_app):

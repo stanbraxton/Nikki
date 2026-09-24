@@ -7,6 +7,7 @@ inspects pending tool calls, asks the human for approval where required, and res
 from __future__ import annotations
 
 import logging
+import socket
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -21,19 +22,120 @@ from app.tools import registry
 log = logging.getLogger("nikki.agent")
 
 
+# Anthropic models that still take a fixed thinking budget. Everything else is
+# assumed to want adaptive thinking: new model IDs trend that way, so an unknown
+# name defaults to the supported path rather than the removed one.
+#
+# The split is not cosmetic. On Sonnet 5 / Opus 5 / Opus 4.7+ the API removed BOTH
+# `thinking.type: "enabled"` (with budget_tokens) and the sampling parameters, so
+# the old call failed twice over:
+#   400 "thinking.type.enabled" is not supported for this model.
+#       Use "thinking.type.adaptive" and "output_config.effort" ...
+# and `temperature: 1` is rejected on the same models for the same reason.
+_LEGACY_THINKING_PREFIXES = ("claude-haiku-4-5", "claude-sonnet-4-5", "claude-3")
+
+
+def uses_adaptive_thinking(name: str) -> bool:
+    """True when this model wants adaptive thinking + effort, not a token budget."""
+    return not name.startswith(_LEGACY_THINKING_PREFIXES)
+
+
 def make_model(spec: str | None = None) -> BaseChatModel:
     """`provider:model` -> chat model. Providers: anthropic, openai."""
-    provider, _, name = (spec or settings.model).partition(":")
+    resolved = spec or settings.model
+    provider, _, name = resolved.partition(":")
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
-        return ChatAnthropic(model=name, max_tokens=settings.max_tokens, streaming=True, api_key=settings.anthropic_api_key)
+        kwargs: dict[str, Any] = {"model": name, "streaming": True,
+                                  "api_key": settings.anthropic_api_key,
+                                  "max_tokens": settings.max_tokens}
+        budget = settings.thinking_budget_tokens
+        note = "thinking off"
+        if budget > 0:
+            if uses_adaptive_thinking(name):
+                # `reasoning_effort` alone is the whole configuration: langchain maps it
+                # to output_config.effort AND, because `thinking` is left unset, defaults
+                # thinking to {"type": "adaptive", "display": "summarized"}.
+                #
+                # "summarized" is load-bearing, not incidental. The API default is
+                # "omitted", which returns thinking blocks whose text is EMPTY - and
+                # ui.py's stream_segment only renders a block when block["thinking"] is
+                # truthy. Setting `thinking` by hand here would buy a working request
+                # that renders nothing, which is indistinguishable from thinking being off.
+                #
+                # Deliberately NOT set on this path: `temperature` (rejected, 400) and the
+                # max_tokens bump (that headroom exists to fit a fixed budget, which
+                # adaptive thinking does not have).
+                kwargs["reasoning_effort"] = settings.thinking_effort
+                note = f"thinking adaptive, effort={settings.thinking_effort}"
+            else:
+                # Legacy path: a fixed budget needs max_tokens > budget and temperature 1.
+                kwargs.update({"max_tokens": max(settings.max_tokens, budget + 4096),
+                               "temperature": 1,
+                               "thinking": {"type": "enabled", "budget_tokens": budget}})
+                note = f"thinking budget={budget}"
+        # Logged because route_model() can silently change which model a turn uses.
+        # Without this line an unexplained bill has nothing to attribute it to.
+        log.info("model resolved: %s (%s, max_tokens=%s)", resolved, note, kwargs["max_tokens"])
+        return ChatAnthropic(**kwargs)
     if provider == "openai":
         from langchain_openai import ChatOpenAI
 
+        log.info("model resolved: %s (thinking n/a, openai)", resolved)
         return ChatOpenAI(model=name, streaming=True, api_key=settings.openai_api_key)
     raise ValueError(f"unknown model provider: {provider!r} (use anthropic:<model> or openai:<model>)")
 
+
+
+# Tools that mean this turn is engineering work rather than conversation.
+ENGINEER_TOOLS = {
+    "repo_open", "repo_read", "repo_search", "repo_write", "repo_edit", "repo_git",
+    "repo_check", "repo_commit_push", "repo_run", "deploy_app", "deploy_self",
+    "scaffold_app", "build_log", "app_status", "set_convex_env",
+}
+
+_ENGINEER_HINTS = ("repo", "deploy", "build", "convex", "typescript", "commit", "push",
+                   "schema", "mutation", "import error", "typecheck", "wellcollar",
+                   "branch", "pull request", "stack trace", "traceback")
+
+
+def route_model(user_text: str, recent_tools: set[str] | None = None) -> str | None:
+    """An Opus-class model for engineering turns, when NIKKI_ENGINEER_MODEL is set.
+
+    Returns None when routing is off or the turn looks like ordinary conversation,
+    so the caller keeps whatever model is already selected. Sermon coaching and a
+    Convex refactor are not the same cognitive task and should not share a model.
+    """
+    if not settings.engineer_model:
+        return None
+    hit = recent_tools & ENGINEER_TOOLS if recent_tools else set()
+    if hit:
+        log.info("route_model -> %s (engineer tool used: %s)",
+                 settings.engineer_model, ", ".join(sorted(hit)))
+        return settings.engineer_model
+    t = (user_text or "").lower()
+    word = next((h for h in _ENGINEER_HINTS if h in t), None)
+    if word:
+        log.info("route_model -> %s (matched hint %r)", settings.engineer_model, word)
+        return settings.engineer_model
+    return None
+
+
+def route_light_model(user_text: str, recent_tools: set[str] | None = None,
+                      has_attachments: bool = False) -> str | None:
+    """NIKKI_LIGHT_MODEL for a short, plain conversational turn; None otherwise (off by default)."""
+    if not settings.light_model or has_attachments:
+        return None
+    t = (user_text or "").strip()
+    if not t or len(t) > settings.light_model_max_chars:
+        return None
+    if recent_tools and recent_tools & ENGINEER_TOOLS:
+        return None
+    if any(h in t.lower() for h in _ENGINEER_HINTS):
+        return None
+    log.info("route_light_model -> %s (short conversational turn, %d chars)", settings.light_model, len(t))
+    return settings.light_model
 
 _BILLING_MARKERS = ("credit balance is too low", "insufficient_quota", "billing_hard_limit_reached", "exceeded your current quota")
 
@@ -67,6 +169,63 @@ def is_too_large_error(e: BaseException) -> bool:
     return any(m in txt for m in _TOO_LARGE_MARKERS)
 
 
+def _is_transient_error(e: BaseException) -> bool:
+    """True when retrying the same request could plausibly succeed."""
+    if isinstance(e, (TimeoutError, ConnectionError, socket.timeout, socket.gaierror)):
+        return True
+    try:
+        import httpx
+        # Timeouts, connection resets, DNS failures, protocol errors.
+        if isinstance(e, (httpx.TimeoutException, httpx.TransportError)):
+            return True
+        if isinstance(e, httpx.HTTPStatusError):
+            code = e.response.status_code
+            return code == 429 or 500 <= code < 600
+    except ImportError:
+        pass
+    return False
+
+
+# Deterministic failures: the same input will fail the same way every time,
+# so telling the user to resend just burns their tokens and their patience.
+#
+# ORDER MATTERS — ConnectionError and TimeoutError are subclasses of OSError,
+# so _is_transient_error() must be consulted before this tuple is tested.
+_BUG_ERRORS = (
+    OSError,            # FileNotFoundError, PermissionError, IsADirectoryError, ...
+    TypeError,
+    ValueError,         # includes json.JSONDecodeError
+    KeyError,
+    IndexError,
+    AttributeError,
+    NameError,
+    ImportError,
+    ZeroDivisionError,
+    AssertionError,
+    NotImplementedError,
+)
+
+
+def _bug_hint(e: BaseException) -> str:
+    """One extra line pointing at the likely cause, when we can guess it."""
+    if isinstance(e, FileNotFoundError):
+        return (
+            "\n\nThis is usually a tool writing to a path that does not exist in the "
+            "container — a relative path resolved against a missing working directory, "
+            "or `mkdir()` without `parents=True`."
+        )
+    if isinstance(e, PermissionError):
+        return (
+            "\n\nThis is usually a tool writing outside the one writable location: on "
+            "Cloud Run the filesystem is read-only apart from /tmp and mounted volumes."
+        )
+    if isinstance(e, ImportError):
+        return "\n\nThis is usually a dependency missing from the deployed image."
+    if isinstance(e, (KeyError, AttributeError, TypeError)):
+        return "\n\nThis is usually a tool receiving a payload in a shape it did not expect."
+    return ""
+
+
 def friendly_error(e: BaseException) -> str:
     """Human-readable message for an unrecoverable turn failure: problem / solutions / recommendation."""
     if is_billing_error(e):
@@ -87,13 +246,44 @@ def friendly_error(e: BaseException) -> str:
             "3. Raise the provider's rate limits (OpenAI: platform.openai.com/account/rate-limits).\n\n"
             "**Recommendation:** option 1 — fastest and free."
         )
+
+    # Always put the full traceback in the logs, whatever branch we return.
+    log.exception("Turn failed: %s", type(e).__name__)
+
+    detail = f"`{type(e).__name__}: {str(e)[:600]}`"
+
+    if _is_transient_error(e):
+        return (
+            f"⚠️ **Problem:** the request failed with {detail}. This looks transient — "
+            "a network timeout or a provider hiccup.\n\n"
+            "**Possible solutions:**\n"
+            "1. Send the message again.\n"
+            "2. Start a new thread if the error repeats.\n"
+            "3. Ask Stan to check the service logs if it persists.\n\n"
+            "**Recommendation:** option 1 first, then 2."
+        )
+
+    if isinstance(e, _BUG_ERRORS):
+        return (
+            f"⚠️ **Problem:** the request failed with {detail}. This is a bug in my code, "
+            "not a hiccup — **resending will produce the same error.**"
+            f"{_bug_hint(e)}\n\n"
+            "**Possible solutions:**\n"
+            "1. Ask Stan to check the service logs — the full traceback is there, with the "
+            "file and line number.\n"
+            "2. Rephrase so the request takes a different path (a different tool, or fewer "
+            "files at once), if you need an answer before it is fixed.\n\n"
+            "**Recommendation:** option 1 — this one needs a code change."
+        )
+
     return (
-        f"⚠️ **Problem:** the request failed with `{type(e).__name__}: {str(e)[:600]}`.\n\n"
+        f"⚠️ **Problem:** the request failed with {detail}. I cannot tell whether this is "
+        "transient or a bug.\n\n"
         "**Possible solutions:**\n"
-        "1. Send the message again (transient provider errors are common).\n"
-        "2. Start a new thread if the error repeats.\n"
-        "3. Ask Stan to check the service logs if it persists.\n\n"
-        "**Recommendation:** option 1 first, then 2."
+        "1. Send the message once more — if it fails identically, it is not transient.\n"
+        "2. Start a new thread.\n"
+        "3. Ask Stan to check the service logs.\n\n"
+        "**Recommendation:** option 1 once, then option 3 — do not keep resending."
     )
 
 
@@ -136,62 +326,36 @@ def system_prompt_parts() -> tuple[str, str]:
         skills = registry.skill_report()
         loaded = ", ".join(t for s in skills for t in s["tools"]) or "none yet"
         extra = (
-            "Admin-only capabilities: file tools (workspace-sandboxed), SQL tools, and self-maintenance tools that let "
-            "you author new Python skills (write_skill) which become live tools instantly. "
+            "Admin-only capabilities: file tools (workspace-sandboxed), SQL tools, the engineer "
+            "toolchain (GitHub repos, Cloud Build, Firebase, Convex), Spaces micro-app deploys, "
+            "browser automation, background jobs, document tools, and self-maintenance tools that "
+            "let you author new Python skills which become live tools instantly. "
             f"User-authored skills currently loaded: {loaded}. "
-            "When a task needs a capability you lack, propose a skill, use skill_template, iterate with test_skill (runs one tool "
-            "of the candidate for real and returns its output or traceback), then write_skill — which REQUIRES a test_call and "
-            "saves only if that call succeeds. Never describe a skill as working before its test passed. "
-            "Skill rules: import built-ins only from app.tools.* (browser = app.tools.browser, @tool objects called via "
-            ".func(...)); never hardcode passwords/tokens in a skill (use os.environ / integration credentials); never ship "
-            "placeholder logic. "
-            "If a skill errors twice with the same message, read_skill and fix the code instead of asking the user to retry. "
-            "Website automation method (in this order): 1) browser_open the site and perform the action once by hand "
-            "(browser_click/browser_type); 2) browser_network to see the JSON API calls the page made, browser_network_detail "
-            "for the exact request/response; 3) replay them with http_request (browser_cookies for the session) — this is "
-            "fast and reliable, clicking through the UI in a skill is not; 4) if it must run for a long time or repeatedly "
-            "(polling, 'every minute until 5 pm', bulk work), write a self-contained Python script and job_start it as a "
-            "background job: credentials go in secret_put → secrets=, the script prints JSON lines, and you report with "
-            "job_logs/job_status. A chat turn is never the place for a loop longer than a couple of minutes. "
-            "Spaces: you can build and deploy independent web micro-apps (dashboards, trackers, calculators) "
-            "with deploy_space. Write a complete, self-contained, production-quality app: for 'fastapi' pass a "
-            "full index.html (inline CSS/JS, responsive, polished) and optionally a main.py exposing `app` for "
-            "JSON endpoints; for 'streamlit' pass a full app.py; for 'node' pass index.html plus an optional "
-            "Express server.js. Pick a short slug, state the slug and framework before calling the tool, and tell "
-            "the user the build takes 3-6 minutes and the link appears in the Spaces Gallery (/spaces). Do not poll "
-            "space_status repeatedly in one turn; the UI tracks progress. "
-            "Engineer toolchain: you maintain real software projects hosted on GitHub — repo_open a repo, then "
-            "repo_list/repo_read/repo_search to understand it, repo_edit/repo_write to change it (local, ungated), "
-            "repo_git for status/diff/log, repo_commit_push to publish (gated), deploy_app to build on Cloud Build and "
-            "publish to Firebase Hosting (+ Convex backend) (gated), app_status/build_log to follow a build. Work like "
-            "a careful engineer: read before editing, keep diffs minimal, summarize the diff before pushing, and never "
-            "deploy with uncommitted changes. "
-            "NEW APPS: when asked to build a new web app (SaaS, tracker, portal, tool with users/data), do NOT start "
-            "from an empty repo — call scaffold_app(slug, title, description) (gated). It creates the GitHub repo from "
-            "the starter template (React/Vite/Tailwind + Convex Auth email/password + multi-tenant orgs/teams/invites + "
-            "example CRUD + admin HTTP + Firebase Hosting), prepares the Convex env (auth keys, SITE_URL, ADMIN_SECRET, "
-            "RESEND_API_KEY) and registers the app. Then ask the owner for ONE thing: a Convex production deploy key "
-            "(dashboard → new project named after the slug → Production → Settings → Deploy Keys). Store it with "
-            "register_app(..., convex_deploy_key=...), add app-specific API keys with set_convex_env, deploy_app, and "
-            "then build the real domain on top: read the repo README.md first; replace the example `items` table; keep "
-            "every tenant table keyed by orgId and use orgQuery/orgMutation; add pages + sidebar entries; write real "
-            "landing copy (never per-seat pricing). Deploy again after each meaningful milestone and report the URL. "
-            "Micro-Spaces (deploy_space) are for small single-purpose tools without accounts; scaffold_app is for real "
-            "apps with users and data. "
-            "Your own source code is the GitHub repo stanbraxton/Nikki (this Chainlit/FastAPI app): you CAN change "
-            "your own UI and behavior with the same tools — repo_open stanbraxton/Nikki, then edit "
-            ".chainlit/config.toml ([[UI.header_links]] = top-header links), public/nikki.js / public/nikki.css, or the "
-            "HTML pages in app/, and repo_commit_push. Pushing to main auto-deploys: a Cloud Build trigger builds the "
-            "pushed commit and rolls a new revision of the nikki Cloud Run service in ~5 minutes — tell the user that, "
-            "no further action needed. deploy_self (gated) is the fallback if the trigger fails. Never claim a change to your own UI is "
-            "impossible or ask which repo you live in. "
-            "Sermon prep: whenever the conversation is about a sermon, series, passage or 'itch', kb_read sermon-prep FIRST and follow it (coach, don't author). When Stan asks for the document / Word doc / 'compile it' / 'bring it home', do NOT write a scaffold or markdown: call sermon_outline_schema, fill EVERY field from the whole session in his own words (✍️ prefix on anything you draft), then compile_sermon_outline — it renders the exact template and files it in Drive Church/Sermons. NEVER ask Stan to supply a title, point statements, illustration or closing assignment before compiling: if they are open (or an older draft in your workspace still shows [FILL IN]), those blanks are YOURS to draft from his material with a ✍️ prefix plus alternates, then compile. Ask zero questions; compile, then invite him to rework the ✍️ lines. If the prep happened in an earlier chat, recover it with recall_chats(search='proverbs') then recall_thread(id) — never hand-write SQL for this. Never open a fresh chat by reading an old scaffold file; the transcript is the source. "
-            "Files and documents: anything the user attaches in chat is saved under uploads/ (path given in the message) and already rendered as text — do not ask them to re-send it. read_document reads PDF/Word/Excel/PowerPoint/CSV/images/audio from the workspace or after drive_read/downloads. Create deliverables with xlsx_create/xlsx_update, pptx_create, pdf_create (Markdown in), pdf_form_fields + pdf_fill_form for forms, pdf_sign for a visible signature, render_docx/compile_sermon_outline for Word; text_to_speech reads text aloud, transcribe_audio handles voice memos. Every created file is attached to the chat automatically — just mention it, never paste a fake link. To put a file in Google Drive, drive_find_folder then drive_upload. "
-            "Browser: for sites that need JavaScript, a login, clicking or form filling use browser_open → read the numbered elements → browser_click / browser_type / browser_select → browser_snapshot; browser_screenshot shows the user the page. Prefer http_fetch/web_search for plain reading. Never enter payment details, place bets or wagers, send messages, or submit anything irreversible without asking the user first in that turn; if a site asks for credentials, ask the user to provide them (or log in themselves) rather than guessing. browser_close when a logged-in task is done. "
-            "Sports: sports_odds gives live lines (espnbet = the user's theScore Bet lines); sports_scores gives results. Quote his book's line first, then note where other books are better. "
-            f"Knowledge base (curated docs about the owner, his company, this system and every project; read the "
-            f"relevant doc with kb_read before answering questions about them, search with kb_search, record durable "
-            f"learnings with kb_write): {kb_index}. "
+            "\n\nROUTING — the rules for each of these areas live in the knowledge base, not here. "
+            "Before you act in one of them, kb_read the named doc and follow it. Read it even when "
+            "the task looks small, and do not work from a half-memory of it:\n"
+            "- Repo work, commits, deploys, build failures, browser automation, background jobs, "
+            "writing your own skills → nikki-system\n"
+            "- Creating a NEW app, or deploying a Space → building-apps\n"
+            "- Google/Microsoft integrations, custom REST APIs → accounts-and-integrations\n"
+            "- Reading or producing documents, spreadsheets, decks, PDFs, audio → files-and-documents\n"
+            "- Sermons, series, passages, an \'itch\' → sermon-prep (coach, never author)\n"
+            "- Odds, lines, scores → sports\n"
+            "- A specific project or company → the matching project-* doc\n\n"
+            "Before any push or deploy, run repo_check on the repo. It is read-only, instant and "
+            "needs no approval, and it catches the TypeScript patterns that have broken every "
+            "Convex build here. A failed Cloud Build costs minutes; this costs nothing. "
+            "Your own source code is the GitHub repo stanbraxton/Nikki (this Chainlit/FastAPI app): "
+            "you CAN change your own UI and behavior with the same tools — repo_open "
+            "stanbraxton/Nikki, then edit .chainlit/config.toml ([[UI.header_links]] = top-header "
+            "links), public/nikki.js / public/nikki.css, or the HTML pages in app/, and "
+            "repo_commit_push. Pushing to main auto-deploys: a Cloud Build trigger builds the pushed "
+            "commit and rolls a new revision of the nikki Cloud Run service in ~5 minutes — tell the "
+            "user that, no further action needed. deploy_self (gated) is the fallback if the trigger "
+            "fails. Never claim a change to your own UI is impossible or ask which repo you live in. "
+            f"\n\nKnowledge base (curated docs about the owner, his company, this system and every "
+            f"project; read the relevant doc with kb_read before answering questions about them, "
+            f"search with kb_search, record durable learnings with kb_write): {kb_index}."
         )
     else:
         extra = ""
@@ -200,10 +364,20 @@ def system_prompt_parts() -> tuple[str, str]:
         f"{persona}\n\n{common}{extra}"
         "Tools marked as requiring approval will pause for the user's confirmation; explain briefly "
         "what you are about to do before calling them. Answer in plain, well-structured Markdown. "
+        "Say plainly when you are unsure, and distinguish what you verified against a tool or document "
+        "from what you are inferring. When a request is ambiguous in a way that changes what you would "
+        "do, and the work is slow or hard to undo, ask one clarifying question before starting instead "
+        "of guessing. When you need several independent reads or lookups, request them together "
+        "in one step rather than one per step - each step re-sends the whole conversation. "
         "Whenever you encounter an error (a failed tool call, an API refusal, missing access), never just report "
         "the raw error: state the problem in plain words, list the possible solutions, and give your recommendation."
     )
-    volatile = f"{who}\nCurrent date/time: {datetime.now(timezone.utc):%A %Y-%m-%d %H:%M} UTC.\n\n{memory_block}".strip()
+    # Date only. This block sits in front of the whole conversation, so anything that changes
+    # here invalidates the prompt cache for every message after it. It used to carry HH:MM,
+    # which changed every minute: no user turn could ever read the previous turn's cached
+    # history, and each one paid full price for all of it. The clock now rides on the
+    # latest user message instead (see stamp_latest_user_message).
+    volatile = f"{who}\nToday's date: {datetime.now(timezone.utc):%A %Y-%m-%d} (UTC).\n\n{memory_block}".strip()
     return stable, volatile
 
 
@@ -275,20 +449,41 @@ def trim_history(messages: list[Any], budget_tokens: int | None = None) -> list[
     Always keeps the most recent user turn and everything after it. Cuts only at a
     HumanMessage boundary so tool_use/tool_result pairs are never split. The stored
     checkpoint is untouched; only the messages sent to the model are trimmed.
+
+    Cache-stable: the cut may only land on a fixed set of "checkpoints" - the first user
+    turn after every `budget // 2` tokens of history, measured from the START of the
+    thread. Those positions never move as the thread grows, so the cut stays put for
+    many turns and the prompt cache keeps hitting. The previous version moved the cut
+    by one turn on every message once a thread was over budget, which changed the very
+    first message sent and turned every turn of a long thread into a full-price cache miss.
     """
     budget = budget_tokens or settings.history_budget_tokens
-    total = sum(_approx_tokens(m) for m in messages)
+    sizes = [_approx_tokens(m) for m in messages]
+    total = sum(sizes)
     if total <= budget:
         return messages
     human_idx = [i for i, m in enumerate(messages) if isinstance(m, HumanMessage)]
-    cut = 0
-    for i in human_idx[1:]:
-        if total <= budget:
-            break
-        total -= sum(_approx_tokens(m) for m in messages[cut:i])
-        cut = i
+    last_human = human_idx[-1] if human_idx else 0
+    step = max(budget // 2, 1)
+    checkpoints: list[int] = []
+    running, next_mark = 0, step
+    for i, m in enumerate(messages):
+        if running >= next_mark and isinstance(m, HumanMessage):
+            checkpoints.append(i)
+            while next_mark <= running:
+                next_mark += step
+        running += sizes[i]
+    usable = [c for c in checkpoints if c <= last_human]
+    cut = next((c for c in usable if sum(sizes[c:]) <= budget), None)
+    if cut is None:
+        # No checkpoint gets under budget (e.g. one enormous recent turn): fall back to
+        # dropping whole turns one at a time, as before.
+        cut = usable[-1] if usable else 0
+        for i in human_idx[1:]:
+            if i > cut and sum(sizes[cut:]) > budget:
+                cut = i
     if cut:
-        log.info("trimmed history: dropped %d messages, ~%d tokens remain", cut, total)
+        log.info("trimmed history: dropped %d messages, ~%d tokens remain", cut, sum(sizes[cut:]))
     return messages[cut:]
 
 
@@ -327,9 +522,52 @@ def mark_cache_breakpoint(messages: list[Any]) -> list[Any]:
     return [*messages[:-1], last.model_copy(update={"content": blocks})]
 
 
+_STAMPS: dict[str, str] = {}
+
+
+def stamp_latest_user_message(messages: list[Any]) -> list[Any]:
+    """Prefix user messages (copies) with the UTC time they were first sent to the model.
+
+    The clock used to live in the system prompt, where it broke the prompt cache every
+    minute. Now the latest user message gets a stamp when first seen, and the stamp is
+    remembered per message id and re-applied on every later call - so each request is a
+    byte-identical extension of the previous one and the cache keeps hitting across tool
+    rounds, approvals and later turns. Older messages this process never stamped (e.g.
+    after a restart) are left alone rather than given a made-up time.
+    """
+    from datetime import datetime, timezone
+
+    last = next((i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], HumanMessage)), None)
+    if last is None:
+        return messages
+    out = list(messages)
+    for i, m in enumerate(messages):
+        if not isinstance(m, HumanMessage):
+            continue
+        key = getattr(m, "id", None)
+        stamp = _STAMPS.get(key) if key else None
+        if stamp is None and i == last:
+            if len(_STAMPS) > 20000:
+                _STAMPS.clear()
+            stamp = f"[Current time: {datetime.now(timezone.utc):%A %Y-%m-%d %H:%M} UTC]"
+            if key:
+                _STAMPS[key] = stamp
+        if stamp is None:
+            continue
+        content = m.content
+        if isinstance(content, str):
+            content = f"{stamp}\n{content}"
+        elif isinstance(content, list):
+            content = [{"type": "text", "text": stamp}, *content]
+        else:
+            continue
+        out[i] = m.model_copy(update={"content": content})
+    return out
+
+
 def _prepare_messages(msgs: list[Any], anthropic: bool) -> list[Any]:
     budget = settings.history_budget_tokens_anthropic if anthropic else settings.history_budget_tokens
-    out = compact_old_tool_results(trim_history(repair_history(list(msgs)), budget))
+    out = stamp_latest_user_message(compact_old_tool_results(trim_history(repair_history(list(msgs)), budget)))
     return mark_cache_breakpoint(out) if anthropic else out
 
 

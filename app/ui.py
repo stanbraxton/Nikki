@@ -12,7 +12,8 @@ from chainlit.input_widget import Select
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
 from app import persistence
-from app.agent import build_graph, fallback_model_for, friendly_error, is_billing_error, pending_tool_calls, rejection_messages, text_of
+from app.agent import build_graph, fallback_model_for, friendly_error, is_billing_error, pending_tool_calls, rejection_messages, route_light_model, route_model, text_of
+from app.guards import TurnBudget, UsageMeter, calls_model_next, daily_cap_message
 from app.tools.artifacts import FILE_MARK, marks_in
 from app.tools.images import IMAGE_MARK
 from app.config import settings
@@ -68,6 +69,9 @@ async def watch_space(slug: str) -> None:
     await card.update()
 
 MODEL_CHOICES = [
+    "anthropic:claude-opus-5",
+    "anthropic:claude-sonnet-5",
+    "anthropic:claude-haiku-4-5-20251001",
     "anthropic:claude-sonnet-4-5",
     "anthropic:claude-opus-4-1",
     "anthropic:claude-haiku-4-5",
@@ -239,22 +243,57 @@ async def _on_reject(action: cl.Action) -> None:
 
 
 # ---------------------------------------------------------------- streaming
+# One budget per USER TURN, keyed by thread, shared across approval continuations.
+#
+# An approval pauses the turn and resumes it as a fresh Chainlit turn with a new
+# TurnRenderer. Holding the budget on the renderer would reset the repeat counters
+# at every approval -- and the loop this guards against is made of GATED calls
+# (repo_commit_push x3 on 2026-09-18), so it would have reset each time and caught
+# nothing. Keyed to the thread, the counters survive the pause.
+_turn_budgets: dict[str, TurnBudget] = {}
+
+
+def turn_budget(thread_id: str, *, new_turn: bool) -> TurnBudget:
+    if new_turn or thread_id not in _turn_budgets:
+        _turn_budgets[thread_id] = TurnBudget(
+            max_tool_rounds=settings.max_tool_rounds,
+            max_repeats=settings.max_repeated_tool_calls,
+            token_ceiling=settings.turn_token_ceiling,
+        )
+    return _turn_budgets[thread_id]
+
+
 class TurnRenderer:
     """Turns LangGraph stream events into Chainlit messages and steps."""
 
-    def __init__(self, thread_id: str) -> None:
+    def __init__(self, thread_id: str, *, new_turn: bool = True) -> None:
         self.thread_id = thread_id
         self.msg: cl.Message | None = None
+        self.msg_text: list[str] = []  # accumulate streamed tokens for persistence
         self.reasoning: cl.Step | None = None
         self.steps: dict[str, cl.Step] = {}
         self.final_text: list[str] = []
-        self.input_tokens: int = 0
-        self.output_tokens: int = 0
+        self.usage = UsageMeter()
+        self.budget = turn_budget(thread_id, new_turn=new_turn)
+
+    @property
+    def input_tokens(self) -> int:
+        return self.usage.input_tokens
+
+    @property
+    def output_tokens(self) -> int:
+        return self.usage.output_tokens
+
+    def note_usage(self, msg: Any, *, final: bool = False) -> None:
+        """Record token usage for this turn. See guards.UsageMeter for the two traps
+        (assign-vs-accumulate, and the same call arriving on both stream modes)."""
+        self.usage.note(msg, final=final)
 
     async def token(self, text: str) -> None:
         if self.msg is None:
             self.msg = cl.Message(content="")
             await self.msg.send()
+        self.msg_text.append(text)
         await self.msg.stream_token(text)
 
     async def thinking(self, text: str) -> None:
@@ -268,14 +307,16 @@ class TurnRenderer:
             await self.reasoning.update()
             self.reasoning = None
         if self.msg is not None:
-            if self.msg.content.strip():
-                self.final_text.append(self.msg.content)
-                # `send` finalizes a streamed message. `update` leaves the client turn
-                # in its active/Stop state when the next event is an approval checkpoint.
-                await self.msg.send()
+            # Update content from accumulated tokens before persisting
+            full_text = "".join(self.msg_text)
+            if full_text:
+                self.msg.content = full_text
+                self.final_text.append(full_text)
+                await self.msg.update()
             else:
                 await self.msg.remove()
             self.msg = None
+            self.msg_text = []
 
     async def tool_planned(self, tc: dict) -> None:
         step = cl.Step(name=tc["name"], type="tool")
@@ -283,6 +324,11 @@ class TurnRenderer:
         await step.send()
         self.steps[tc["id"]] = step
         await persistence.trace(self.thread_id, "tool_call", tc)
+        # Remembered so route_model can upgrade a later turn on this thread that started as
+        # ordinary conversation and drifted into engineering work.
+        seen = cl.user_session.get("recent_tools") or set()
+        seen.add(tc["name"])
+        cl.user_session.set("recent_tools", seen)
 
     async def show_image(self, out: str) -> None:
         """Render an image a tool saved in the workspace inline in the chat."""
@@ -319,11 +365,7 @@ async def stream_segment(graph, config: dict, inp: Any, r: TurnRenderer) -> None
             msg, meta = chunk
             if meta.get("langgraph_node") != "agent" or not isinstance(msg, AIMessageChunk):
                 continue
-            # Capture token usage from message metadata
-            if hasattr(msg, "usage_metadata") and msg.usage_metadata:
-                usage = msg.usage_metadata
-                r.input_tokens = usage.get("input_tokens", 0)
-                r.output_tokens = usage.get("output_tokens", 0)
+            r.note_usage(msg)
             content = msg.content
             if isinstance(content, list):
                 for block in content:
@@ -338,11 +380,7 @@ async def stream_segment(graph, config: dict, inp: Any, r: TurnRenderer) -> None
                     continue
                 for m in update.get("messages", []):
                     if node == "agent" and isinstance(m, AIMessage):
-                        # Capture usage from complete AIMessage too
-                        if hasattr(m, "usage_metadata") and m.usage_metadata:
-                            usage = m.usage_metadata
-                            r.input_tokens = usage.get("input_tokens", 0)
-                            r.output_tokens = usage.get("output_tokens", 0)
+                        r.note_usage(m, final=True)
                         if m.tool_calls:
                             await r.close_segment()
                             for tc in m.tool_calls:
@@ -377,12 +415,61 @@ async def on_message(message: cl.Message) -> None:
 async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "TurnRenderer", thread_id: str, preapproved: bool | None = None) -> None:
     """Run one turn until complete or until an approval checkpoint is rendered."""
     while True:
+        if await calls_model_next(graph, config, inp):
+            r.budget.start_round()
         await stream_segment(graph, config, inp, r)
         await r.close_segment()
+
+        # A finished turn is finished, whatever the budget says. Checking the budget
+        # first appended "used all 16 tool rounds ... looping" to turns whose 16th
+        # round was the final answer (SmartTutor fix, 2026-09-23).
         state = await graph.aget_state(config)
         if not state.next:
             break
+
+        # Budget spent: stop cleanly rather than letting recursion_limit throw.
+        stop = r.budget.stop_reason(r.input_tokens, r.output_tokens, r.usage.cache_read, r.usage.cache_creation)
+        if stop:
+            log.warning("turn %s stopped by budget: %s", thread_id,
+                        r.budget.summary(r.input_tokens, r.output_tokens, r.usage.cache_read, r.usage.cache_creation))
+            await persistence.trace(thread_id, "budget_stop", {
+                "rounds": r.budget.rounds,
+                "input_tokens": r.input_tokens,
+                "output_tokens": r.output_tokens,
+            })
+            await cl.Message(content=stop).send()
+            _turn_budgets.pop(thread_id, None)
+            return
+
         calls = pending_tool_calls(state)
+
+        # The same call, with the same arguments, for the third time. This is the
+        # Pivoten failure: "Step 2: Enable Pivoten import HTTP endpoint" pushed
+        # three times because nothing remembered the first two.
+        repeats = [tc for tc in calls if r.budget.would_repeat(tc["name"], tc.get("args"))]
+        if repeats:
+            log.warning("turn %s blocked repeated calls: %s", thread_id,
+                        [tc["name"] for tc in repeats])
+            await persistence.trace(thread_id, "repeat_blocked",
+                                    {"tools": [tc["name"] for tc in repeats]})
+            for tc in calls:
+                step = r.steps.pop(tc["id"], None)
+                if step:
+                    step.output = "blocked: identical call already tried this turn"
+                    step.is_error = True
+                    await step.update()
+            await graph.aupdate_state(
+                config,
+                {"messages": rejection_messages(calls, r.budget.repeat_message(repeats[0]["name"]))},
+                as_node="tools",
+            )
+            inp = None
+            graph = build_graph(cp, model)
+            continue
+
+        for tc in calls:
+            r.budget.record(tc["name"], tc.get("args"))
+
         gated = [tc for tc in calls if registry.requires_approval(tc["name"], tc.get("args"))]
         if gated:
             if preapproved is None:
@@ -402,6 +489,7 @@ async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "Tu
         # resume from the interrupt; rebuild so hot-loaded skills are bound to the model
         inp = None
         graph = build_graph(cp, model)
+    _turn_budgets.pop(thread_id, None)  # turn finished normally
 
 
 async def _continue_approval(thread_id: str, approved: bool, approval_id: str | None = None) -> bool:
@@ -420,7 +508,7 @@ async def _continue_approval(thread_id: str, approved: bool, approval_id: str | 
         async with lock:
             model = cl.user_session.get("model") or settings.model
             config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.recursion_limit}
-            r = TurnRenderer(thread_id)
+            r = TurnRenderer(thread_id, new_turn=False)
             try:
                 approval_id, claim = await persistence.claim_pending_approval(
                     thread_id, principal.tenant_id, principal.email, approved, approval_id
@@ -478,7 +566,8 @@ async def _continue_approval(thread_id: str, approved: bool, approval_id: str | 
             _turn_locks.pop(thread_id, None)
         reset_principal(principal_token)
     if r.input_tokens > 0 or r.output_tokens > 0:
-        await persistence.log_token_usage(thread_id, model, r.input_tokens, r.output_tokens)
+        await persistence.log_token_usage(thread_id, model, r.input_tokens, r.output_tokens,
+                                          r.usage.cache_read, r.usage.cache_creation)
     return True
 
 
@@ -507,11 +596,29 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
     r = TurnRenderer(thread_id)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.recursion_limit}
 
+    stop = await daily_cap_message()
+    if stop:
+        await persistence.trace(thread_id, "budget_stop", {"reason": "daily_token_cap"})
+        await cl.Message(content=stop).send()
+        return
+
     # Handle file attachments: save each one into the workspace (uploads/) so tools can act on it,
     # and inline a text rendering (PDF/DOCX/XLSX/PPTX/CSV text, image transcription, audio transcript).
     user_content = message.content
     if message.elements:
         user_content = await asyncio.to_thread(ingest_uploads, message.content, message.elements)
+
+    # Route engineering turns to a stronger model, unless the user picked one
+    # explicitly in the chat settings panel (an explicit choice always wins).
+    routed = route_model(message.content, cl.user_session.get("recent_tools"))
+    if routed and (cl.user_session.get("model") or settings.model) == settings.model:
+        model = routed
+        await persistence.trace(thread_id, "model_routed", {"to": routed})
+    elif not routed and (cl.user_session.get("model") or settings.model) == settings.model:
+        light = route_light_model(message.content, cl.user_session.get("recent_tools"), bool(message.elements))
+        if light:
+            model = light
+            await persistence.trace(thread_id, "model_routed", {"to": light, "reason": "light"})
 
     try:
         async with persistence.checkpointer() as cp:
@@ -559,4 +666,5 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
     
     # Log token usage for this turn
     if r.input_tokens > 0 or r.output_tokens > 0:
-        await persistence.log_token_usage(thread_id, model, r.input_tokens, r.output_tokens)
+        await persistence.log_token_usage(thread_id, model, r.input_tokens, r.output_tokens,
+                                          r.usage.cache_read, r.usage.cache_creation)
