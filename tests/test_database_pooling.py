@@ -19,6 +19,9 @@ def test_async_pool_has_one_connection_and_no_overflow():
     assert '"max_overflow": _MAX_OVERFLOW' in config
     assert "_POOL_SIZE = 1" in PERSISTENCE
     assert "_MAX_OVERFLOW = 0" in PERSISTENCE
+    # Stale-connection guard (2026-09-24): Cloud SQL closed idle sockets and
+    # /api/run failed with "connection is closed" until the pool pinged first.
+    assert '"pool_pre_ping": True' in config
 
 
 def test_chainlit_uses_the_same_limited_engine_settings():
@@ -64,6 +67,8 @@ def test_checkpointer_uses_one_shared_postgres_connection():
     assert "max_size=1" in PERSISTENCE
     assert "_checkpoint_setup_lock" in PERSISTENCE
     assert "if not _checkpoint_ready:" in PERSISTENCE
+    assert "check=AsyncConnectionPool.check_connection" in PERSISTENCE
+    assert "max_idle=300" in PERSISTENCE
 
 
 if __name__ == "__main__":

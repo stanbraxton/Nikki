@@ -236,7 +236,11 @@ def async_engine_kwargs() -> dict[str, Any]:
         "pool_size": _POOL_SIZE,
         "max_overflow": _MAX_OVERFLOW,
         "pool_timeout": _POOL_TIMEOUT,
-        "pool_recycle": 1800,
+        # Cloud SQL drops idle connections; recycle well before that and ping
+        # before every checkout so a dead socket is replaced instead of raised
+        # ("connection is closed" 500s on /api/run, 2026-09-24).
+        "pool_recycle": 600,
+        "pool_pre_ping": True,
     }
 
 
@@ -639,7 +643,23 @@ async def checkpointer() -> AsyncIterator[Any]:
                     conninfo=settings.database_url,
                     min_size=0,
                     max_size=1,
-                    kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+                    kwargs={
+                        "autocommit": True,
+                        "prepare_threshold": 0,
+                        "row_factory": dict_row,
+                        # libpq TCP keepalives so a silently dropped socket is
+                        # noticed instead of failing mid-turn.
+                        "keepalives": 1,
+                        "keepalives_idle": 60,
+                        "keepalives_interval": 10,
+                        "keepalives_count": 3,
+                    },
+                    # Verify the connection before handing it out; retire idle
+                    # ones before Cloud SQL closes them ("server closed the
+                    # connection unexpectedly" mid-run, 2026-09-24).
+                    check=AsyncConnectionPool.check_connection,
+                    max_idle=300,
+                    max_lifetime=1800,
                     open=False,
                 )
                 await _checkpoint_pool.open()
