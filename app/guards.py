@@ -213,14 +213,20 @@ class TurnBudget:
                 "going in circles, and a narrower request fixes that faster than a bigger budget."
             )
         if self.round_limit_hit():
+            if any(n >= 2 for n in self.seen.values()):
+                return (
+                    f"⚠️ **Problem:** this turn used all {self.max_tool_rounds} of its tool rounds "
+                    "and repeated some of the same calls, so I may have been going in circles.\n\n"
+                    "**Possible solutions:**\n"
+                    "1. Ask me to do one concrete step instead of the whole task.\n"
+                    "2. Tell me what you saw go wrong, so I stop repeating the same approach.\n\n"
+                    "**Recommendation:** option 1."
+                )
+            # Every call was different: this was real progress on a long task, not a loop.
+            # Calling it "looping" (as this message used to) was simply wrong.
             return (
-                f"⚠️ **Problem:** this turn used all {self.max_tool_rounds} of its tool rounds "
-                "without finishing, which usually means I was looping rather than progressing.\n\n"
-                "**Possible solutions:**\n"
-                "1. Ask me to do one concrete step instead of the whole task.\n"
-                "2. Tell me what you saw go wrong, so I stop repeating the same approach.\n"
-                "3. Raise NIKKI_MAX_TOOL_ROUNDS if the task really is this long.\n\n"
-                "**Recommendation:** option 1."
+                f"⏸️ I've used this turn's {self.max_tool_rounds} tool steps and I'm not finished yet. "
+                "Nothing is lost - reply **continue** and I'll pick up where I stopped."
             )
         return None
 

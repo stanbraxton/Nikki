@@ -52,7 +52,10 @@ class Settings:
     # so a looping turn ran nearly twice as long before anything stopped it.
     recursion_limit: int = int(_env("NIKKI_RECURSION_LIMIT", "18"))
     # Tool rounds in one user turn (one round = one model call plus its tools).
-    max_tool_rounds: int = int(_env("NIKKI_MAX_TOOL_ROUNDS", "16"))
+    # Raised from 16: real engineering and data tasks (read schema, read a few files, write a
+    # script, run it) routinely need 16-25 steps. Runaway loops are caught separately by the
+    # repeat guard, the per-turn token ceiling and the daily cap, not by this number.
+    max_tool_rounds: int = int(_env("NIKKI_MAX_TOOL_ROUNDS", "30"))
     # How many times one tool may be called with identical arguments in a turn
     # before the call is refused. 2 allows a legitimate retry; 3+ is a loop.
     max_repeated_tool_calls: int = int(_env("NIKKI_MAX_REPEATED_TOOL_CALLS", "2"))
