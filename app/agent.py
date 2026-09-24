@@ -287,13 +287,38 @@ def friendly_error(e: BaseException) -> str:
     )
 
 
-def system_prompt() -> str:
+def system_prompt(model_spec: str | None = None) -> str:
     """Full system prompt as one string (stable part + volatile part)."""
-    stable, volatile = system_prompt_parts()
+    stable, volatile = system_prompt_parts(model_spec)
     return f"{stable}\n\n{volatile}"
 
 
-def system_prompt_parts() -> tuple[str, str]:
+def model_identity(model_spec: str | None = None) -> str:
+    """One sentence telling Nikki which model she is actually running on.
+
+    Without it she answered "what version are you" from stale training data
+    ("Claude 3.5 Sonnet") while running on something else entirely. The spec is fixed
+    for a given graph, so this belongs in the cached stable half - and the prompt
+    cache is per model anyway, so a routed model change costs nothing extra here.
+    """
+    spec = model_spec or settings.model
+    provider, _, name = spec.partition(":")
+    return (f"You are currently running on the model `{name}` (provider: {provider}). "
+            "If asked which model or version you are, say exactly that. ")
+
+
+# Nikki's training data predates the model lineup she runs on. She once told Stan that
+# Opus 5.5 "doesn't exist" while it was Anthropic's recommended default.
+FRESHNESS_RULE = (
+    "Your built-in knowledge of AI models, prices, product versions and other fast-moving facts is "
+    "out of date. Before stating that one exists, does not exist, or costs a given amount, check a "
+    "primary source - for Claude models, https://platform.claude.com/docs/en/models/overview - and "
+    "report what it says. Never tell the user something does not exist based on memory alone; if you "
+    "cannot verify it, say you could not confirm it. "
+)
+
+
+def system_prompt_parts(model_spec: str | None = None) -> tuple[str, str]:
     """(stable, volatile) halves of the system prompt.
 
     The stable half (persona, capabilities, KB index, rules) is identical from turn to turn and is
@@ -361,7 +386,7 @@ def system_prompt_parts() -> tuple[str, str]:
         extra = ""
     persona = settings.persona if admin else settings.tenant_persona
     stable = (
-        f"{persona}\n\n{common}{extra}"
+        f"{persona}\n\n{model_identity(model_spec)}{FRESHNESS_RULE}{common}{extra}"
         "Tools marked as requiring approval will pause for the user's confirmation; explain briefly "
         "what you are about to do before calling them. Answer in plain, well-structured Markdown. "
         "Say plainly when you are unsure, and distinguish what you verified against a tool or document "
@@ -383,7 +408,7 @@ def system_prompt_parts() -> tuple[str, str]:
 
 def system_message(model_spec: str | None = None) -> Any:
     """System prompt for the given model: cached content blocks on Anthropic, plain text elsewhere."""
-    stable, volatile = system_prompt_parts()
+    stable, volatile = system_prompt_parts(model_spec)
     if (model_spec or settings.model).partition(":")[0] != "anthropic":
         return f"{stable}\n\n{volatile}"
     from langchain_core.messages import SystemMessage
