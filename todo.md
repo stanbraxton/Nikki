@@ -20,7 +20,7 @@ reasoning-upgrade branch landed with every cost-affecting setting pinned to its
 pre-merge value on the Cloud Run service, so per-turn cost should be flat and each
 setting can be enabled individually and read against `/turns`.
 
-## 1. `/account/password` — reviewed fix, routes currently disabled
+## 1. `/account/password` — DONE 2026-09-25 (branch `fix-password-page`): all three fixed, routes enabled, no current password asked (session is the proof); see tests/test_password_page.py
 
 The page (Nikki's own `e06c8ab`) is merged but **not reachable**: both `@router`
 decorators are commented out at `app/auth.py:185` and `:190`, under a banner at
@@ -29,7 +29,7 @@ served a request in production, so re-enabling is its debut, not a restoration.
 
 Three defects, all to be fixed in one reviewed commit:
 
-- [ ] **Admin password changes silently revert.** `authenticate()` verifies against
+- [x] **Admin password changes silently revert.** `authenticate()` verifies against
       `password_hash` in the accounts table (`app/auth.py:87`), and `password_submit`
       writes the new hash there — so the change works at first. But `ensure_admin()`
       (`app/auth.py:57`) overwrites the admin row with `settings.admin_password_hash`
@@ -38,8 +38,8 @@ Three defects, all to be fixed in one reviewed commit:
       and no log line. Non-admin accounts are unaffected. Decide deliberately whether
       the env var or the database is authoritative for the admin — the bug is that
       both currently claim to be.
-- [ ] **No rate limiting on the current-password check** — a password-guessing oracle.
-- [ ] **`_password_form(error=...)` interpolates into HTML unescaped** (`app/auth.py:247`).
+- [x] **No rate limiting on the current-password check** — a password-guessing oracle.
+- [x] **`_password_form(error=...)` interpolates into HTML unescaped** (`app/auth.py:247`).
       Not exploitable while every caller passes a literal, but one user-derived
       message away from being so.
 

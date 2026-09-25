@@ -148,6 +148,11 @@ accounts = Table(
     Column("display_name", String(120)),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("last_login_at", DateTime(timezone=True)),
+    # Admin row only: the ADMIN_PASSWORD_HASH value last copied into password_hash.
+    # ensure_admin() re-applies the env hash only when it differs from this, so a
+    # password changed in the app survives restarts while rotating the env var
+    # still works as a recovery path.
+    Column("env_hash_applied", Text),
 )
 
 integrations = Table(
@@ -333,6 +338,7 @@ def _migrate(conn) -> None:
         "memories": {"tenant_id": "VARCHAR(64) NOT NULL DEFAULT 'admin'"},
         "schedules": {"tenant_id": "VARCHAR(64) NOT NULL DEFAULT 'admin'", "label": "VARCHAR(60) NOT NULL DEFAULT ''"},
         "scheduled_runs": {"tenant_id": "VARCHAR(64) NOT NULL DEFAULT 'admin'"},
+        "accounts": {"env_hash_applied": "TEXT"},
         "token_usage": {"cache_read_tokens": "INTEGER NOT NULL DEFAULT 0",
                         "cache_creation_tokens": "INTEGER NOT NULL DEFAULT 0"},
     }
