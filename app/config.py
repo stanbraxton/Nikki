@@ -81,7 +81,17 @@ class Settings:
     # but costs nothing extra. Extended thinking and the sonnet-5 bump ship as one change and
     # their cost impact can be read on its own; stacking an Opus-class model on engineering
     # turns is a separate decision, made once there is a bill to compare against.
-    engineer_model: str = _env("NIKKI_ENGINEER_MODEL", "anthropic:claude-sonnet-5") or ""
+    # Upgraded 2026-09-25 from sonnet-5: engineering and data-analysis turns are where Nikki's
+    # mistakes were expensive (a lost day of edits redone wrong, an in-sample "edge" that
+    # vanished out of sample, filters that would have broken Elo). Opus costs ~2x Sonnet 5 per
+    # token, but only on these turns; ordinary chat stays on NIKKI_MODEL.
+    engineer_model: str = _env("NIKKI_ENGINEER_MODEL", "anthropic:claude-opus-5-5") or ""
+    # Thinking depth on routed engineering/analysis turns (adaptive models). Chat keeps
+    # NIKKI_THINKING_EFFORT. Valid: low | medium | high | xhigh | max.
+    engineer_thinking_effort: str = _env("NIKKI_ENGINEER_THINKING_EFFORT", "high") or "high"
+    # Second-opinion review of every repo_commit_push diff before it leaves the box.
+    # Empty disables. Fails open (a review outage never blocks a push, it just warns).
+    review_model: str = _env("NIKKI_REVIEW_MODEL", "anthropic:claude-opus-5-5") or ""
     # Cheaper model for short, plain conversational turns (e.g. "anthropic:claude-haiku-4-5").
     # Empty = off, the default: turn it on deliberately and compare /turns before and after.
     # Never used for engineering turns, turns with attachments, or long messages.

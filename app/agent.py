@@ -67,8 +67,12 @@ def make_model(spec: str | None = None) -> BaseChatModel:
                 # Deliberately NOT set on this path: `temperature` (rejected, 400) and the
                 # max_tokens bump (that headroom exists to fit a fixed budget, which
                 # adaptive thinking does not have).
-                kwargs["reasoning_effort"] = settings.thinking_effort
-                note = f"thinking adaptive, effort={settings.thinking_effort}"
+                # Routed engineering/analysis turns think harder than ordinary chat.
+                eng = getattr(settings, "engineer_model", "")
+                effort = (getattr(settings, "engineer_thinking_effort", settings.thinking_effort)
+                          if eng and resolved == eng and eng != settings.model else settings.thinking_effort)
+                kwargs["reasoning_effort"] = effort
+                note = f"thinking adaptive, effort={effort}"
             else:
                 # Legacy path: a fixed budget needs max_tokens > budget and temperature 1.
                 kwargs.update({"max_tokens": max(settings.max_tokens, budget + 4096),
@@ -97,7 +101,11 @@ ENGINEER_TOOLS = {
 
 _ENGINEER_HINTS = ("repo", "deploy", "build", "convex", "typescript", "commit", "push",
                    "schema", "mutation", "import error", "typecheck", "wellcollar",
-                   "branch", "pull request", "stack trace", "traceback")
+                   "branch", "pull request", "stack trace", "traceback",
+                   # Quantitative analysis: the same care as code (Golden Picks backtests).
+                   "backtest", "regression", "log-loss", "logloss", "win rate", "win/loss",
+                   "losing percentage", "winning percentage", "analyze", "analyse", "analysis", "dataset",
+                   "calibrat", "out of sample", "out-of-sample", "kelly", "expected value")
 
 
 def route_model(user_text: str, recent_tools: set[str] | None = None) -> str | None:
@@ -360,10 +368,12 @@ def system_prompt_parts(model_spec: str | None = None) -> tuple[str, str]:
             "Before you act in one of them, kb_read the named doc and follow it. Read it even when "
             "the task looks small, and do not work from a half-memory of it:\n"
             "- Repo work, commits, deploys, build failures, browser automation, background jobs, "
-            "writing your own skills → nikki-system\n"
+            "writing your own skills → nikki-system (includes the engineering checklist)\n"
             "- Creating a NEW app, or deploying a Space → building-apps\n"
             "- Google/Microsoft integrations, custom REST APIs → accounts-and-integrations\n"
             "- Reading or producing documents, spreadsheets, decks, PDFs, audio → files-and-documents\n"
+            "- Data analysis, backtests, betting or model evaluation, any claim of an 'edge' → "
+            "research-method (follow its checklist before reporting a result)\n"
             "- Sermons, series, passages, an \'itch\' → sermon-prep (coach, never author)\n"
             "- Odds, lines, scores → sports\n"
             "- A specific project or company → the matching project-* doc\n\n"

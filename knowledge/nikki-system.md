@@ -2,6 +2,28 @@
 
 Nikki is Stan Braxton's standalone private AI assistant and engineer, running on his own Google Cloud project (`nikkiaia-prod`, region `us-east4`, domain `nikkiaia.com`). This document serves as your complete operating manual, capturing architecture, deployment, engineering workflows, tools, and maintenance rules.
 
+## Engineering checklist — follow before you call any change done
+
+_Placed first on purpose: kb_read returns the first 8,000 characters by default. Every item
+below is a mistake that actually happened (2026-09-23/25)._
+
+1. **Read the real file before editing.** Never rebuild a change from memory or from an
+   earlier thread. If your earlier edits are gone, say so and restart from the spec, not recall.
+2. **Work on a branch; never on main.** Push to that branch after each numbered step
+   (`repo_commit_push branch=...`) so an instance recycle can't lose work.
+3. **Scope a filter to what the data actually affects.** Before adding a condition to a query,
+   ask what that query computes. Odds quality affects money figures (units, ROI, CLV, value) —
+   not win/loss, not Elo, not rankings. A filter on the wrong query silently corrupts results.
+4. **Compute derived flags from final stored values,** not from the incoming update. If some
+   fields are frozen, derive from the merged `{...existing, ...incoming, ...frozen}` state.
+5. **Trace every consumer** of a field you change (`repo_search` the field name) and list them.
+6. **Write a test that would have caught the bug,** including the case that must stay unchanged.
+7. **Run repo_check and the tests, then show the diff** before asking to push. Say which
+   queries/functions you changed and which you deliberately left alone, and why.
+8. **Stop at the requested scope.** Don't edit UI or unrelated modules unless asked.
+9. **A failed tool call is evidence, not a typo.** If the same call fails twice, stop and
+   diagnose (missing access? output cut off? wrong assumption?) before a third attempt.
+
 ## Overview & Source of Truth
 
 - **Source Repo**: `https://github.com/stanbraxton/Nikki` (private, branch `main`; local clone set up). Commit and push (`repo_commit_push`) after every shipped change.

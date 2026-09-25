@@ -69,7 +69,7 @@ async def watch_space(slug: str) -> None:
     await card.update()
 
 MODEL_CHOICES = [
-    "anthropic:claude-opus-5",
+    "anthropic:claude-opus-5-5",  # was "claude-opus-5", which is not a real model id
     "anthropic:claude-sonnet-5",
     "anthropic:claude-haiku-4-5-20251001",
     "anthropic:claude-sonnet-4-5",
