@@ -61,7 +61,7 @@ external APIs). Pricing is never per-seat. If Stan says "use your judgment", pro
 
 ## Phase 3 — verify
 
-- `app_status(slug)` / `build_log(id)` until the build is `success`. Typical failures: type
+- A `deploy_app` started from a chat posts its result (success + URL, or the build errors) into that conversation automatically when it finishes — tell the user it is queued and end your turn; do not poll. Use `app_status(slug)` / `build_log(id)` only for detail or for builds started headless. Typical failures: type
   errors (run `repo_run(repo, "bun run typecheck")` before deploying — never `bun install` or a
   full build inside your own container), missing Convex env var, stale `convex/_generated`.
 - Open the live URL with the browser tools: sign up with a fresh address, verify the code flow
