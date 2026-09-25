@@ -15,6 +15,7 @@ frontend with the production Convex URL) → Firebase Hosting deploy. Progress l
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -805,6 +806,60 @@ def _stage_dir(app: dict, bid: str) -> Path:
     return stage
 
 
+# ---------------------------------------------------------------- build follow-up
+# A deploy runs in a background thread and outlives the chat turn that started it,
+# so the model never learns the result unless someone asks. We remember the chat
+# session that queued each build and post the outcome back into that conversation
+# when it finishes (live if the chat is open; saved to the thread either way).
+_build_chats: dict[str, tuple] = {}  # build id -> (chainlit session, event loop)
+
+
+def _capture_chat() -> tuple | None:
+    """The Chainlit session + loop of the chat turn calling this tool, or None (headless run)."""
+    try:
+        from chainlit.context import get_context
+
+        ctx = get_context()
+        if not getattr(ctx.session, "thread_id", None):
+            return None
+        return ctx.session, ctx.loop
+    except Exception:  # noqa: BLE001 — no chat context (scheduled/headless run)
+        return None
+
+
+def _build_result_text(bid: str, slug: str) -> str:
+    b = _build_row(bid) or {}
+    if b.get("status") == "success":
+        return f"✅ Deploy finished: **{slug}** (build `{bid}`) succeeded and is live at {b.get('url') or '(no url)'}."
+    log_text = b.get("log") or ""
+    marker = "--- Cloud Build errors ---"
+    tail = log_text.split(marker, 1)[1] if marker in log_text else log_text
+    lines = [ln for ln in tail.strip().splitlines() if ln.strip()][-25:]
+    return (f"❌ Deploy failed: **{slug}** (build `{bid}`). Nothing new went live.\n\n```\n"
+            + "\n".join(lines) + "\n```")
+
+
+def _notify_build(bid: str, slug: str) -> None:
+    """Post the finished build's result into the conversation that started it (once)."""
+    target = _build_chats.pop(bid, None)
+    if not target:
+        return
+    session, loop = target
+    text = _build_result_text(bid, slug)
+
+    async def _post() -> None:
+        import chainlit as cl
+        from chainlit.context import init_ws_context
+
+        init_ws_context(session)
+        await cl.Message(content=text).send()
+
+    try:
+        asyncio.run_coroutine_threadsafe(_post(), loop).result(timeout=30)
+    except Exception as e:  # noqa: BLE001 — a missed notification must never fail the build
+        log.warning("could not post build result for %s: %s", bid, e)
+
+
 def _run_build(bid: str, app: dict) -> None:
     slug = app["slug"]
     try:
@@ -832,15 +887,18 @@ def _run_build(bid: str, app: dict) -> None:
                     pass
             _set_build(bid, status="failed", finished_at=_now())
             _set_app(slug, status="failed")
+            _notify_build(bid, slug)
             return
         url = f"https://{app['custom_domain']}" if app.get("custom_domain") else f"https://{app['firebase_site']}.web.app"
         _set_build(bid, status="success", finished_at=_now(), url=url)
         _set_app(slug, status="live", url=url)
+        _notify_build(bid, slug)
     except Exception as e:  # noqa: BLE001
         log.exception("build %s failed", bid)
         _append_build_log(bid, f"error: {e}")
         _set_build(bid, status="failed", finished_at=_now())
         _set_app(slug, status="failed")
+        _notify_build(bid, slug)
 
 
 _CB_ID_RE = re.compile(r"/builds/([0-9a-f-]{36})")
@@ -915,7 +973,9 @@ def _reconcile_build(b: dict | None) -> dict | None:
 def deploy_app(slug: str) -> str:
     """Deploy a registered app: snapshot the repo's committed HEAD, build on Cloud Build (bun install, convex
     deploy + frontend build, Firebase Hosting deploy) and publish. Requires approval. Returns a build id
-    immediately; the build takes 3-8 minutes — check with app_status / build_log, don't poll in a loop."""
+    immediately; the build takes 3-8 minutes. When started from a chat, the result (success + URL, or the
+    build errors) is posted into this conversation automatically when it finishes — so don't poll: tell the
+    user it's queued and that the result will appear here, then end your turn."""
     slug = slug.strip().lower()
     app = _app(slug)
     if not app:
@@ -931,8 +991,15 @@ def deploy_app(slug: str) -> str:
     bid = f"{slug}-{uuid.uuid4().hex[:8]}"
     with persistence.sync_engine().begin() as c:
         c.execute(insert(persistence.builds).values(id=bid, slug=slug, status="queued", log="", started_at=_now()))
+    chat = _capture_chat()
+    if chat:
+        _build_chats[bid] = chat
     threading.Thread(target=_run_build, args=(bid, app), name=f"build-{bid}", daemon=True).start()
-    return f"build {bid} queued for {slug} (HEAD {_git(path, 'rev-parse', '--short', 'HEAD', check=False)}). Check app_status('{slug}') in a few minutes."
+    head = _git(path, 'rev-parse', '--short', 'HEAD', check=False)
+    if chat:
+        return (f"build {bid} queued for {slug} (HEAD {head}). The result will be posted in this conversation "
+                "automatically when it finishes (3-8 min) — don't poll; tell the user and end your turn.")
+    return f"build {bid} queued for {slug} (HEAD {head}). Check app_status('{slug}') in a few minutes."
 
 
 @tool
