@@ -2,7 +2,9 @@
 
 Repos are cloned from GitHub into an ephemeral working directory (`ENGINEER_REPOS_DIR`,
 default /tmp/repos) and re-cloned transparently when the instance was recycled — GitHub is
-the source of truth, the working tree is scratch. Local edits and read-only git commands
+the source of truth, the working tree is scratch. Uncommitted edits are backed up to a hidden
+ref (refs/nikki-wip/<branch>) after every change and restored by repo_open, so a recycle no
+longer loses work. Local edits and read-only git commands
 are ungated; anything that leaves the box (push, repo creation, deploys, custom domains)
 requires approval.
 
@@ -93,8 +95,9 @@ def _remote(repo: str) -> str:
     return f"https://x-access-token:{tok}@github.com/{repo}.git" if tok else f"https://github.com/{repo}.git"
 
 
-def _git(repo_path: Path, *args: str, timeout: int = 120, check: bool = True) -> str:
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
+def _git(repo_path: Path, *args: str, timeout: int = 120, check: bool = True,
+         extra_env: dict[str, str] | None = None) -> str:
+    env = {**os.environ, **(extra_env or {}), "GIT_TERMINAL_PROMPT": "0",
            "GIT_AUTHOR_NAME": GIT_AUTHOR[0], "GIT_AUTHOR_EMAIL": GIT_AUTHOR[1],
            "GIT_COMMITTER_NAME": GIT_AUTHOR[0], "GIT_COMMITTER_EMAIL": GIT_AUTHOR[1]}
     r = subprocess.run(["git", *args], cwd=repo_path, capture_output=True, text=True, timeout=timeout, env=env)
@@ -128,6 +131,78 @@ def _ensure_clone(repo: str, branch: str | None = None) -> Path:
         if branch:
             _git(path, "checkout", branch, check=False)
     return path
+
+
+# ------------------------------------------------------------------ work-in-progress autosave
+#
+# The working tree lives in ENGINEER_REPOS_DIR (/tmp/repos on Cloud Run), which is wiped
+# whenever the instance is recycled. On 2026-09-25 a full day of unpushed Golden Picks
+# edits vanished that way and were redone from memory - worse. So every local edit is
+# snapshotted to a hidden ref on GitHub, refs/nikki-wip/<branch>. It is not a branch:
+# no build trigger fires on it, it does not show in the branch list, and it never
+# touches the real index, HEAD or working tree. repo_open restores it; a real push or
+# a clean working tree deletes it.
+
+WIP_PREFIX = "refs/nikki-wip/"
+
+
+def _wip_ref(path: Path) -> str:
+    cur = _git(path, "rev-parse", "--abbrev-ref", "HEAD", check=False).strip() or "HEAD"
+    safe = re.sub(r"[^A-Za-z0-9._/-]", "-", "detached" if cur == "HEAD" else cur)
+    return WIP_PREFIX + safe
+
+
+def _autosave(repo: str) -> str:
+    """Snapshot uncommitted changes to the hidden WIP ref. Never raises; returns a short note."""
+    try:
+        path = _repo_dir(repo)
+        if not github_token() or not (path / ".git").exists():
+            return ""
+        ref = _wip_ref(path)
+        if not _git(path, "status", "--porcelain", check=False).strip():
+            _git(path, "push", "origin", f":{ref}", timeout=60, check=False)  # nothing unsaved: clear it
+            return ""
+        # A throwaway index, passed to these three calls only: the real index, HEAD and
+        # working tree are never touched, and concurrent tool calls are unaffected.
+        tmp_index = path / ".git" / "nikki-wip-index"
+        idx = {"GIT_INDEX_FILE": str(tmp_index)}
+        try:
+            _git(path, "read-tree", "HEAD", extra_env=idx)
+            _git(path, "add", "-A", extra_env=idx)
+            tree = _git(path, "write-tree", extra_env=idx).strip()
+        finally:
+            tmp_index.unlink(missing_ok=True)
+        head = _git(path, "rev-parse", "HEAD").strip()
+        sha = _git(path, "commit-tree", tree, "-p", head, "-m", f"nikki wip autosave {_now():%Y-%m-%d %H:%M} UTC").strip()
+        _git(path, "push", "--force", "origin", f"{sha}:{ref}", timeout=60)
+        return ""
+    except Exception as e:  # noqa: BLE001 - autosave must never break an edit
+        log.warning("wip autosave failed for %s: %s", repo, e)
+        return "\n(warning: work-in-progress backup failed - push to a branch soon so this isn't lost)"
+
+
+def _restore_wip(path: Path) -> str:
+    """Re-apply an autosaved snapshot onto a clean working tree. Returns a note for repo_open."""
+    if _git(path, "status", "--porcelain", check=False).strip():
+        return ""  # local edits already present; never clobber them
+    ref = _wip_ref(path)
+    if not _git(path, "ls-remote", "origin", ref, check=False).strip():
+        return ""
+    _git(path, "fetch", "origin", f"{ref}:{ref}", "--force", timeout=120)
+    diff = _git(path, "diff", "--binary", "HEAD", ref, check=False)
+    if not diff.strip():
+        return ""
+    r = subprocess.run(["git", "apply", "--3way", "--whitespace=nowarn"], cwd=path, input=diff + "\n",
+                       capture_output=True, text=True, timeout=120)
+    when = _git(path, "log", "-1", "--format=%s", ref, check=False)
+    files = _git(path, "diff", "--name-only", "HEAD", ref, check=False).splitlines()
+    if r.returncode != 0:
+        return (f"\n\n⚠️ Found unsaved work from an earlier session ({when}) but it no longer applies cleanly "
+                f"to the current branch. It is kept on GitHub at {ref}; inspect with repo_git "
+                f"'diff HEAD {ref}'.")
+    return (f"\n\n♻️ Restored unsaved work from an earlier session ({when}) - "
+            f"{len(files)} file(s): {', '.join(files[:10])}{' ...' if len(files) > 10 else ''}. "
+            "Check it with repo_git 'diff' before continuing.")
 
 
 def _resolve(repo_path: Path, rel: str) -> Path:
@@ -180,7 +255,11 @@ def repo_open(repo: str, branch: str = "") -> str:
         pull = _git(path, "pull", "--ff-only", check=False)
         head = _git(path, "log", "-1", "--format=%h %s (%cr)", check=False)
         cur = _git(path, "rev-parse", "--abbrev-ref", "HEAD", check=False)
-        return f"{repo} @ {cur}: {head}\n{pull.splitlines()[-1] if pull else ''}\n\n{_tree(path, '.', 2)}"
+        try:
+            restored = _restore_wip(path) if github_token() else ""
+        except Exception as e:  # noqa: BLE001
+            restored = f"\n\n(warning: could not check for unsaved work from an earlier session: {e})"
+        return f"{repo} @ {cur}: {head}\n{pull.splitlines()[-1] if pull else ''}{restored}\n\n{_tree(path, '.', 2)}"
     except Exception as e:  # noqa: BLE001
         return f"error: {e}"
 
@@ -236,7 +315,7 @@ def repo_write(repo: str, path: str, content: str) -> str:
         p = _resolve(_repo_dir(repo), path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
-        return f"wrote {len(content)} chars to {path}"
+        return f"wrote {len(content)} chars to {path}" + _autosave(repo)
     except Exception as e:  # noqa: BLE001
         return f"error: {e}"
 
@@ -256,7 +335,7 @@ def repo_edit(repo: str, path: str, old_text: str, new_text: str, replace_all: b
         if n > 1 and not replace_all:
             return f"error: old_text occurs {n} times; pass replace_all=True or make it more specific"
         p.write_text(src.replace(old_text, new_text) if replace_all else src.replace(old_text, new_text, 1), encoding="utf-8")
-        return f"edited {path} ({n} occurrence{'s' if n > 1 else ''})"
+        return f"edited {path} ({n} occurrence{'s' if n > 1 else ''})" + _autosave(repo)
     except Exception as e:  # noqa: BLE001
         return f"error: {e}"
 
@@ -270,7 +349,13 @@ def repo_git(repo: str, command: str) -> str:
         parts = shlex.split(command)
         if not parts or parts[0] not in READ_ONLY_GIT:
             return f"error: allowed subcommands: {', '.join(sorted(READ_ONLY_GIT))}"
-        return _git(_repo_dir(repo), *parts, check=False)[-8000:] or "(ok)"
+        out = _git(_repo_dir(repo), *parts, check=False)[-8000:] or "(ok)"
+        # These change the working tree - keep the backup in step, including deleting it when
+        # the tree is now clean (e.g. after discarding changes). Not stash: a stash is local,
+        # so deleting the backup on stash would lose that work on the next recycle.
+        if parts[0] in {"checkout", "reset", "rm", "mv", "restore", "switch", "merge", "rebase"}:
+            out += _autosave(repo)
+        return out
     except Exception as e:  # noqa: BLE001
         return f"error: {e}"
 
@@ -355,6 +440,7 @@ def repo_commit_push(repo: str, message: str, branch: str = "", force: bool = Fa
                 return blocked
         _git(path, "commit", "-m", message)
         out = _git(path, "push", "-u", "origin", cur, timeout=300)
+        _autosave(repo)  # tree is clean now, so this deletes the hidden WIP backup
         sha = _git(path, "rev-parse", "--short", "HEAD")
         return f"pushed {sha} to {repo}@{cur}\n{out[-500:]}"
     except Exception as e:  # noqa: BLE001
