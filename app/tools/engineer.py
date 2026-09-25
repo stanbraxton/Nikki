@@ -418,12 +418,83 @@ def repo_check(repo: str) -> str:
 
 
 # ------------------------------------------------------------------ gated repo tools
+# ------------------------------------------------------------------ pre-push review
+#
+# A second, stronger model reads the exact staged diff before it leaves the box. Added
+# 2026-09-25 after a Golden Picks change passed repo_check but would have (a) flipped every
+# game to "suspect" 20 minutes after first pitch and (b) stopped Elo from learning from most
+# games. Neither is a syntax error; both are the kind of thing a careful reviewer catches.
+
+REVIEW_MAX_DIFF = 80_000
+
+REVIEW_SYSTEM = (
+    "You are a strict senior engineer reviewing a diff before it is pushed. Find real defects only: "
+    "logic that is wrong, data that will be corrupted or silently excluded, a filter applied to the "
+    "wrong query, a derived value computed from the wrong inputs, broken behaviour for existing "
+    "rows, missing handling for a case the change itself introduces, secrets, or anything that "
+    "will fail to build or deploy. Ignore style, naming and nice-to-haves. Trace how each changed "
+    "function is used before judging it. Reply with ONLY a JSON object: "
+    '{"blocking": [{"file": "...", "issue": "...", "fix": "..."}], "notes": ["..."]}. '
+    "`blocking` is for defects that would break production or corrupt/omit data; everything "
+    "else goes in `notes`. Empty lists are a valid, good answer."
+)
+
+
+def _review_diff(path: Path, message: str) -> tuple[list[dict], list[str], str]:
+    """(blocking, notes, status). Fails open: any error returns no findings and a status note."""
+    from app.config import settings
+
+    spec = getattr(settings, "review_model", "") or ""
+    provider, _, name = spec.partition(":")
+    if not spec or provider != "anthropic" or not settings.anthropic_api_key:
+        return [], [], ""
+    diff = _git(path, "diff", "--cached", check=False)
+    if not diff.strip():
+        return [], [], ""
+    truncated = len(diff) > REVIEW_MAX_DIFF
+    body = diff[:REVIEW_MAX_DIFF]
+    try:
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=settings.anthropic_api_key, timeout=180)
+        r = client.messages.create(
+            model=name, max_tokens=4000, system=REVIEW_SYSTEM,
+            messages=[{"role": "user", "content":
+                       f"Commit message: {message}\n\n"
+                       + ("(diff truncated to the first 80k characters)\n\n" if truncated else "")
+                       + f"```diff\n{body}\n```"}],
+        )
+        text = "".join(getattr(b, "text", "") for b in r.content)
+        m = re.search(r"\{.*\}", text, re.S)
+        data = json.loads(m.group(0)) if m else {}
+        blocking = [b for b in data.get("blocking", []) if isinstance(b, dict)]
+        notes = [str(n) for n in data.get("notes", [])]
+        log.info("pre-push review (%s): %d blocking, %d notes", name, len(blocking), len(notes))
+        return blocking, notes, ("(review covered only the first 80k characters of the diff)" if truncated else "")
+    except Exception as e:  # noqa: BLE001 - a review outage must never block a push
+        log.warning("pre-push review failed: %s", e)
+        return [], [], f"(pre-push review unavailable: {type(e).__name__}; pushed without it)"
+
+
+def _format_findings(blocking: list[dict], notes: list[str]) -> str:
+    out = []
+    for b in blocking:
+        out.append(f"  - {b.get('file', '?')}: {b.get('issue', '')}"
+                   + (f"\n    fix: {b['fix']}" if b.get("fix") else ""))
+    if notes:
+        out.append("  Notes: " + "; ".join(notes[:8]))
+    return "\n".join(out)
+
+
 @tool
-def repo_commit_push(repo: str, message: str, branch: str = "", force: bool = False) -> str:
+def repo_commit_push(repo: str, message: str, branch: str = "", force: bool = False,
+                     override_review: bool = False) -> str:
     """Stage all changes, commit as Nikki and push to GitHub. Requires approval. `branch` defaults to the
     current branch; a new branch name is created and pushed with upstream tracking. Staged convex/ files
     are checked first for the two known build-breaking TypeScript patterns; `force=True` skips that check
-    and must be justified out loud."""
+    and must be justified out loud. Then a stronger reviewer model reads the staged diff; if it reports
+    blocking defects the push is refused - fix them and push again. `override_review=True` pushes anyway
+    and must be justified out loud to the user (e.g. the finding is demonstrably wrong)."""
     try:
         path = _repo_dir(repo)
         if not github_token():
@@ -438,11 +509,24 @@ def repo_commit_push(repo: str, message: str, branch: str = "", force: bool = Fa
             blocked = _convex_gate(path)
             if blocked:
                 return blocked
+        review_blocking, review_notes, review_status = _review_diff(path, message)
+        if review_blocking and not override_review:
+            return ("REVIEW BLOCKED — nothing was pushed. A pre-push review found defects that would "
+                    "break production or corrupt data:\n\n" + _format_findings(review_blocking, review_notes)
+                    + "\n\nFix them and call repo_commit_push again. If a finding is demonstrably wrong, "
+                    "explain why to the user and call again with override_review=True.")
         _git(path, "commit", "-m", message)
         out = _git(path, "push", "-u", "origin", cur, timeout=300)
         _autosave(repo)  # tree is clean now, so this deletes the hidden WIP backup
         sha = _git(path, "rev-parse", "--short", "HEAD")
-        return f"pushed {sha} to {repo}@{cur}\n{out[-500:]}"
+        extra = ""
+        if review_blocking and override_review:
+            extra += "\n\nPushed OVER review objections (override_review=True):\n" + _format_findings(review_blocking, [])
+        if review_notes:
+            extra += "\n\nReviewer notes (non-blocking) - mention any that matter to the user:\n" + _format_findings([], review_notes)
+        if review_status:
+            extra += "\n" + review_status
+        return f"pushed {sha} to {repo}@{cur}\n{out[-500:]}{extra}"
     except Exception as e:  # noqa: BLE001
         return f"error: {e}"
 
