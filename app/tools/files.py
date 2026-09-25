@@ -1,6 +1,7 @@
 """Local file operations, sandboxed to the durable workspace directory."""
 from __future__ import annotations
 
+import functools
 from pathlib import Path
 
 from langchain_core.tools import tool
@@ -19,7 +20,27 @@ def _resolve(rel: str) -> Path:
     return p
 
 
+def _text_errors(fn):
+    """Tool error contract (CLAUDE.md §2): return errors as text, never raise. A raise
+    here ended the whole turn: on 2026-09-25 list_files("../repos") hit the workspace
+    check mid-task and Nikki stopped with a "bug in my code" message instead of seeing
+    the error and switching to the repo tools."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ValueError as e:
+            if "escapes the workspace" in str(e):
+                return (f"error: {e}. These tools only see Nikki's workspace. Cloned GitHub "
+                        "repos are outside it: use repo_list / repo_read / repo_search instead.")
+            return f"error: {e}"
+        except Exception as e:  # noqa: BLE001 — return errors to the model, never raise
+            return f"error: {type(e).__name__}: {e}"
+    return wrapper
+
+
 @tool
+@_text_errors
 def list_files(path: str = ".") -> str:
     """List files and folders inside Nikki's workspace. `path` is relative to the workspace root."""
     p = _resolve(path)
@@ -36,6 +57,7 @@ def list_files(path: str = ".") -> str:
 
 
 @tool
+@_text_errors
 def read_file(path: str) -> str:
     """Read a UTF-8 text file from the workspace. Large files are truncated at 12k characters."""
     p = _resolve(path)
@@ -48,6 +70,7 @@ def read_file(path: str) -> str:
 
 
 @tool
+@_text_errors
 def write_file(path: str, content: str | None = None, append: bool = False) -> str:
     """Create, overwrite, or append to a UTF-8 text file in the workspace.
 
@@ -93,6 +116,7 @@ def write_file(path: str, content: str | None = None, append: bool = False) -> s
 
 
 @tool
+@_text_errors
 def delete_file(path: str) -> str:
     """Delete a single file from the workspace (directories are refused)."""
     p = _resolve(path)
