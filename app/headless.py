@@ -9,7 +9,7 @@ from typing import Any
 from langchain_core.messages import AIMessage
 
 from app import persistence
-from app.agent import build_graph, escalation_target, fallback_model_for, is_billing_error, new_user_message, pending_tool_calls, recent_thread_tools, recent_user_texts, rejection_messages, route_model, text_of, thread_messages
+from app.agent import STRIP_ALL_THINKING, build_graph, escalation_target, fallback_model_for, is_billing_error, is_thinking_binding_error, new_user_message, pending_tool_calls, recent_thread_tools, recent_user_texts, rejection_messages, route_model, text_of, thread_messages
 from app.config import settings
 from app.guards import TurnBudget, UsageMeter, calls_model_next, daily_cap_message
 from app.tools import registry
@@ -21,6 +21,7 @@ async def run_prompt(prompt: str, thread_id: str, auto_approve: bool = False, mo
     # Scheduled and API runs get the same engineering-model routing as the chat UI. An explicit
     # `model` from the caller always wins; routing only fills in the default.
     explicit = model is not None
+    STRIP_ALL_THINKING.set(False)  # never inherit a previous run's retry
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.recursion_limit}
     # The same per-turn budget the interactive path uses. This loop is the one nobody
     # is watching -- and a schedule created through the approval gate may carry
@@ -54,15 +55,26 @@ async def run_prompt(prompt: str, thread_id: str, auto_approve: bool = False, mo
             try:
                 await graph.ainvoke(inp, config)
             except Exception as e:  # noqa: BLE001
-                fb = fallback_model_for(model)
-                if not (fb and is_billing_error(e)):
-                    raise
-                log.warning("billing error on %s; continuing headless run on fallback %s: %r", model or settings.model, fb, e)
-                await persistence.trace(thread_id, "fallback", {"from": model or settings.model, "to": fb, "error": repr(e)})
-                model = fb
-                graph = build_graph(cp, model)
-                state = await graph.aget_state(config)
-                await graph.ainvoke(None if state.next else inp, config)
+                if is_thinking_binding_error(e) and not STRIP_ALL_THINKING.get():
+                    # See strip_old_thinking: retry the rest of this run without earlier
+                    # thinking. The model call failed, so nothing ran; resume it and let
+                    # the normal flow below (approvals, budget) handle the result.
+                    log.warning("headless run %s: thinking-signature mismatch, retrying without earlier thinking: %r", thread_id, e)
+                    await persistence.trace(thread_id, "thinking_retry", {"error": repr(e)[:500], "headless": True})
+                    STRIP_ALL_THINKING.set(True)
+                    graph = build_graph(cp, model)
+                    state = await graph.aget_state(config)
+                    await graph.ainvoke(None if state.next else inp, config)
+                else:
+                    fb = fallback_model_for(model)
+                    if not (fb and is_billing_error(e)):
+                        raise
+                    log.warning("billing error on %s; continuing headless run on fallback %s: %r", model or settings.model, fb, e)
+                    await persistence.trace(thread_id, "fallback", {"from": model or settings.model, "to": fb, "error": repr(e)})
+                    model = fb
+                    graph = build_graph(cp, model)
+                    state = await graph.aget_state(config)
+                    await graph.ainvoke(None if state.next else inp, config)
             state = await graph.aget_state(config)
 
             # Token accounting. ainvoke does not stream, so every AIMessage in the
