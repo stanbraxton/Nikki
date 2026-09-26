@@ -7,6 +7,7 @@ inspects pending tool calls, asks the human for approval where required, and res
 from __future__ import annotations
 
 import logging
+import re
 import socket
 from typing import Any
 
@@ -99,35 +100,132 @@ ENGINEER_TOOLS = {
     "scaffold_app", "build_log", "app_status", "set_convex_env",
 }
 
-_ENGINEER_HINTS = ("repo", "deploy", "build", "convex", "typescript", "commit", "push",
-                   "schema", "mutation", "import error", "typecheck", "wellcollar",
-                   "branch", "pull request", "stack trace", "traceback",
-                   # Quantitative analysis: the same care as code (Golden Picks backtests).
-                   "backtest", "regression", "log-loss", "logloss", "win rate", "win/loss",
-                   "losing percentage", "winning percentage", "analyze", "analyse", "analysis", "dataset",
-                   "calibrat", "out of sample", "out-of-sample", "kelly", "expected value")
+# Tools whose recent use keeps a thread on the engineer model. `escalate` is Nikki
+# asking for the stronger model herself; once she has, the next few turns stay there.
+ROUTE_STICKY_TOOLS = ENGINEER_TOOLS | {"escalate"}
+
+# How many recent user turns of a thread count as "recent" for routing. Routing used to
+# remember tools in the browser session: that never faded (one repo_read and every later
+# "thanks" in the session ran on the engineer model) and it vanished on a page reload
+# (so "continue" after a reload fell back to chat). Reading the thread's own checkpoint
+# fixes both - it survives reloads, approvals and instance changes, and it fades.
+ROUTE_STICKY_TURNS = 3
+
+# Whole words / phrases only. Plain substring matching sent "report" (repo),
+# "committee" (commit) and "pushback" (push) to the engineer model at ~2x the cost.
+# Stems that are deliberately open-ended end in \w*.
+_ENGINEER_HINTS = (
+    r"repos?", r"repository", r"deploy\w*", r"builds?", r"rebuilds?", r"convex", r"typescript",
+    r"commit(?:s|ted|ting)?", r"push(?:ed|es|ing)?(?![\s-]*back)", r"schemas?", r"mutations?",
+    r"import errors?", r"typecheck\w*", r"wellcollar", r"branch(?:es)?", r"pull requests?",
+    r"stack ?traces?", r"tracebacks?",
+    # Quantitative analysis: the same care as code (Golden Picks backtests).
+    r"backtest\w*", r"regression", r"log[- ]?loss", r"win[- ]?rates?", r"win/loss",
+    r"losing percentage", r"winning percentage", r"analy[sz]e[sd]?", r"analy[sz]ing", r"analys[ie]s",
+    r"datasets?", r"calibrat\w*", r"out[- ]of[- ]sample", r"expected value",
+    # Lower-case "kelly" only, or the Kelly criterion by name: "tell Kelly I'll be late" is a person.
+    r"(?-i:kelly)", r"kelly (?:criterion|stake\w*|sizing|fraction\w*|bet\w*)",
+)
+_ENGINEER_HINT_RE = re.compile(r"\b(?:" + "|".join(_ENGINEER_HINTS) + r")\b", re.IGNORECASE)
 
 
-def route_model(user_text: str, recent_tools: set[str] | None = None) -> str | None:
+def engineer_hint(user_text: str) -> str | None:
+    """The first engineering/analysis word or phrase in the text, or None."""
+    m = _ENGINEER_HINT_RE.search(user_text or "")
+    return m.group(0).lower() if m else None
+
+
+def recent_thread_tools(messages: list[Any], turns: int = ROUTE_STICKY_TURNS) -> set[str]:
+    """Names of tools called in the last `turns` user turns of a thread (the current,
+    unfinished one included), read from its messages."""
+    names: set[str] = set()
+    seen_users = 0
+    for m in reversed(messages or []):
+        if isinstance(m, HumanMessage):
+            seen_users += 1
+            if seen_users >= turns:
+                break
+        elif isinstance(m, AIMessage) and m.tool_calls:
+            names.update(tc.get("name", "") for tc in m.tool_calls)
+    names.discard("")
+    return names
+
+
+async def thread_messages(cp: BaseCheckpointSaver, config: dict) -> list[Any]:
+    """The thread's stored messages, straight from the checkpointer (never raises).
+
+    Reading the checkpoint directly avoids building a whole graph (system prompt,
+    memory digest, KB index) just to look at the history before choosing a model.
+    """
+    try:
+        tup = await cp.aget_tuple(config)
+    except Exception:  # noqa: BLE001
+        log.warning("could not read thread checkpoint for routing", exc_info=True)
+        return []
+    if not tup or not tup.checkpoint:
+        return []
+    return list((tup.checkpoint.get("channel_values") or {}).get("messages") or [])
+
+
+def recent_user_texts(messages: list[Any], turns: int = ROUTE_STICKY_TURNS) -> list[str]:
+    """Text of the last `turns` user messages of a thread, newest first."""
+    out: list[str] = []
+    for m in reversed(messages or []):
+        if isinstance(m, HumanMessage):
+            out.append(text_of(m.content))
+            if len(out) >= turns:
+                break
+    return out
+
+
+def route_model(user_text: str, recent_tools: set[str] | None = None,
+                recent_texts: list[str] | None = None) -> str | None:
     """An Opus-class model for engineering turns, when NIKKI_ENGINEER_MODEL is set.
 
     Returns None when routing is off or the turn looks like ordinary conversation,
     so the caller keeps whatever model is already selected. Sermon coaching and a
     Convex refactor are not the same cognitive task and should not share a model.
+    `recent_tools` / `recent_texts` should come from recent_thread_tools() and
+    recent_user_texts(), so stickiness fades. The texts matter for analysis work, which
+    often uses no engineer tool (db_query, jobs, sports) and was routed on wording alone.
     """
     if not settings.engineer_model:
         return None
-    hit = recent_tools & ENGINEER_TOOLS if recent_tools else set()
+    hit = recent_tools & ROUTE_STICKY_TOOLS if recent_tools else set()
     if hit:
-        log.info("route_model -> %s (engineer tool used: %s)",
+        log.info("route_model -> %s (recent tools: %s)",
                  settings.engineer_model, ", ".join(sorted(hit)))
         return settings.engineer_model
-    t = (user_text or "").lower()
-    word = next((h for h in _ENGINEER_HINTS if h in t), None)
+    word = engineer_hint(user_text)
     if word:
         log.info("route_model -> %s (matched hint %r)", settings.engineer_model, word)
         return settings.engineer_model
+    for earlier in recent_texts or []:
+        word = engineer_hint(earlier)
+        if word:
+            log.info("route_model -> %s (recent turn matched hint %r)", settings.engineer_model, word)
+            return settings.engineer_model
     return None
+
+
+def is_auto_model(model: str | None) -> bool:
+    """True when `model` is one routing chose (default or light), not one the user picked."""
+    return model in (None, "", settings.model) or bool(settings.light_model and model == settings.light_model)
+
+
+def escalation_target(model: str | None, calls: list[dict]) -> str | None:
+    """The model to switch to because this round called `escalate`, or None.
+
+    Only an automatically chosen model is switched: a model the user picked in the
+    chat settings always wins, exactly as it does for route_model.
+    """
+    eng = settings.engineer_model
+    if not eng or not any(tc.get("name") == "escalate" for tc in calls or []):
+        return None
+    if model == eng or not is_auto_model(model):
+        return None
+    log.info("escalate -> %s (requested by the model, was %s)", eng, model or settings.model)
+    return eng
 
 
 def route_light_model(user_text: str, recent_tools: set[str] | None = None,
@@ -138,9 +236,9 @@ def route_light_model(user_text: str, recent_tools: set[str] | None = None,
     t = (user_text or "").strip()
     if not t or len(t) > settings.light_model_max_chars:
         return None
-    if recent_tools and recent_tools & ENGINEER_TOOLS:
+    if recent_tools and recent_tools & ROUTE_STICKY_TOOLS:
         return None
-    if any(h in t.lower() for h in _ENGINEER_HINTS):
+    if engineer_hint(t):
         return None
     log.info("route_light_model -> %s (short conversational turn, %d chars)", settings.light_model, len(t))
     return settings.light_model
@@ -380,6 +478,11 @@ def system_prompt_parts(model_spec: str | None = None) -> tuple[str, str]:
             "Before any push or deploy, run repo_check on the repo. It is read-only, instant and "
             "needs no approval, and it catches the TypeScript patterns that have broken every "
             "Convex build here. A failed Cloud Build costs minutes; this costs nothing. "
+            "Multi-turn builds: when repo work will take more than one turn, keep BUILD_PLAN.md at "
+            "the root of the target repo (goal, phases, decisions and why, done, next, open problems). "
+            "repo_read it first in every turn on that repo, update it as each step finishes - a turn "
+            "can stop at its step limit without warning - and commit it with the work. Details: "
+            "nikki-system, checklist item 10. "
             "Your own source code is the GitHub repo stanbraxton/Nikki (this Chainlit/FastAPI app): "
             "you CAN change your own UI and behavior with the same tools — repo_open "
             "stanbraxton/Nikki, then edit .chainlit/config.toml ([[UI.header_links]] = top-header "

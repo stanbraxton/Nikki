@@ -62,8 +62,9 @@ def test_engineer_turns_think_harder() -> None:
 
 def test_analysis_requests_are_routed() -> None:
     S = types.SimpleNamespace(engineer_model="anthropic:claude-opus-5-5")
-    ns = _exec(AGENT, {"ENGINEER_TOOLS", "_ENGINEER_HINTS", "route_model"},
-               {"settings": S, "log": logging.getLogger("t")})
+    ns = _exec(AGENT, {"ENGINEER_TOOLS", "ROUTE_STICKY_TOOLS", "_ENGINEER_HINTS", "_ENGINEER_HINT_RE",
+                       "engineer_hint", "route_model"},
+               {"settings": S, "log": logging.getLogger("t"), "re": re})
     rm = ns["route_model"]
     assert rm("run a backtest on the underdog picks") == "anthropic:claude-opus-5-5"
     assert rm("what is the losing percentage for series fade games") == "anthropic:claude-opus-5-5"
