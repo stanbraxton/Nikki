@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import re
 import socket
+from contextvars import ContextVar
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -575,30 +576,57 @@ def repair_history(messages: list[Any]) -> list[Any]:
 
 _THINKING_BLOCK_TYPES = ("thinking", "redacted_thinking")
 
+# Tools that change the system prompt for the rest of the turn: the memory digest
+# (remember/forget) and the model identity (escalate) live in it. Thinking produced
+# before one of these ran is bound to the old prompt, so the API rejects it with
+# 400 "The `system` prompt differs from the one this block was created with."
+PROMPT_CHANGING_TOOLS = frozenset({"remember", "forget", "escalate"})
 
-def strip_old_thinking(messages: list[Any]) -> list[Any]:
-    """Remove thinking blocks from assistant messages *before* the latest user message.
+# Safety net for mismatches nothing above predicts: after one such 400 the turn is
+# retried with every thinking block removed (see is_thinking_binding_error and the
+# retries in ui._drive / headless.run_prompt). A ContextVar so it lasts for the rest
+# of that turn's task, across graph rebuilds, and never leaks into another turn.
+STRIP_ALL_THINKING: ContextVar[bool] = ContextVar("nikki_strip_all_thinking", default=False)
 
-    The API binds every thinking block's signature to the exact conversation that preceded
-    it. Nikki deliberately rewrites earlier history before each call (trim_history,
-    compact_old_tool_results, time stamps), so an old thinking block no longer matches
-    what now precedes it and the request fails with 400 "Invalid `signature` in
-    `thinking` block. The block is bound to a different conversation." Thinking from
-    finished turns is not used by the model anyway - the API ignores it - so dropping it
-    loses nothing. Thinking inside the current turn (after the latest user message) is
-    kept: the API requires it to continue a tool-use loop, and nothing before it changes.
+
+def strip_old_thinking(messages: list[Any], strip_all: bool = False) -> list[Any]:
+    """Remove thinking blocks the API would reject as bound to a different conversation.
+
+    The API binds every thinking block's signature to the exact conversation - system
+    prompt included - that preceded it. Removed:
+      - thinking from finished turns (before the latest user message). Nikki rewrites
+        that history on every call (trim_history, compact_old_tool_results, stamps), and
+        the API ignores old-turn thinking anyway;
+      - thinking in the current turn made before a PROMPT_CHANGING_TOOLS result, because
+        the system prompt has changed since;
+      - everything, when strip_all is set (the retry after an unexpected mismatch).
+    Other current-turn thinking is kept: the model continues its reasoning with it.
+    Removing a block is always accepted by the API; keeping a stale one never is.
     Non-destructive copy; the stored checkpoint is untouched.
     """
     last_human = max((i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=-1)
+    cutoff = len(messages) if strip_all else last_human
+    if not strip_all:
+        for i in range(last_human + 1, len(messages)):
+            m = messages[i]
+            if isinstance(m, ToolMessage) and getattr(m, "name", None) in PROMPT_CHANGING_TOOLS:
+                cutoff = i
     out: list[Any] = []
     for i, m in enumerate(messages):
-        if i < last_human and isinstance(m, AIMessage) and isinstance(m.content, list):
+        if i < cutoff and isinstance(m, AIMessage) and isinstance(m.content, list):
             kept = [b for b in m.content
                     if not (isinstance(b, dict) and b.get("type") in _THINKING_BLOCK_TYPES)]
             if len(kept) != len(m.content):
                 m = m.model_copy(update={"content": kept})
         out.append(m)
     return out
+
+
+def is_thinking_binding_error(e: BaseException) -> bool:
+    """The API rejected a thinking block as bound to a different conversation."""
+    text = str(e)
+    return "thinking" in text and ("bound to a different conversation" in text
+                                   or "Invalid `signature`" in text)
 
 
 def _approx_tokens(m: Any) -> int:
@@ -752,7 +780,7 @@ def stamp_latest_user_message(messages: list[Any]) -> list[Any]:
 def _prepare_messages(msgs: list[Any], anthropic: bool) -> list[Any]:
     budget = settings.history_budget_tokens_anthropic if anthropic else settings.history_budget_tokens
     out = stamp_latest_user_message(compact_old_tool_results(
-        trim_history(repair_history(strip_old_thinking(list(msgs))), budget)))
+        trim_history(repair_history(strip_old_thinking(list(msgs), STRIP_ALL_THINKING.get())), budget)))
     return mark_cache_breakpoint(out) if anthropic else out
 
 

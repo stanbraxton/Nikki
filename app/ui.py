@@ -12,7 +12,7 @@ from chainlit.input_widget import Select
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 
 from app import persistence
-from app.agent import build_graph, escalation_target, fallback_model_for, friendly_error, is_billing_error, new_user_message, pending_tool_calls, recent_thread_tools, recent_user_texts, rejection_messages, route_light_model, route_model, text_of, thread_messages
+from app.agent import STRIP_ALL_THINKING, build_graph, escalation_target, fallback_model_for, friendly_error, is_billing_error, is_thinking_binding_error, new_user_message, pending_tool_calls, recent_thread_tools, recent_user_texts, rejection_messages, route_light_model, route_model, text_of, thread_messages
 from app.guards import TurnBudget, UsageMeter, calls_model_next, daily_cap_message
 from app.tools.artifacts import FILE_MARK, marks_in
 from app.tools.images import IMAGE_MARK
@@ -416,7 +416,21 @@ async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "Tu
     while True:
         if await calls_model_next(graph, config, inp):
             r.budget.start_round()
-        await stream_segment(graph, config, inp, r)
+        try:
+            await stream_segment(graph, config, inp, r)
+        except Exception as e:  # noqa: BLE001
+            if not is_thinking_binding_error(e) or STRIP_ALL_THINKING.get():
+                raise
+            # A thinking block the API no longer accepts (see strip_old_thinking). Retry
+            # this call, and the rest of the turn, without earlier thinking.
+            log.warning("turn %s: thinking-signature mismatch, retrying without earlier thinking: %r", thread_id, e)
+            await persistence.trace(thread_id, "thinking_retry", {"error": repr(e)[:500]})
+            STRIP_ALL_THINKING.set(True)
+            await r.close_segment()
+            graph = build_graph(cp, model)
+            state = await graph.aget_state(config)
+            inp = None if state.next else inp
+            await stream_segment(graph, config, inp, r)
         await r.close_segment()
 
         # A finished turn is finished, whatever the budget says. Checking the budget
@@ -613,6 +627,7 @@ async def attach_files(rels: list[str]) -> None:
 
 async def _run_turn(message: cl.Message, thread_id: str) -> None:
     model = cl.user_session.get("model") or settings.model
+    STRIP_ALL_THINKING.set(False)  # never inherit a previous turn's retry
     principal = _principal()
     await persistence.trace(thread_id, "user", {"text": message.content, "model": model})
     r = TurnRenderer(thread_id)

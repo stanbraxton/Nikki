@@ -54,7 +54,10 @@ class AIMessage(_Msg):
 
 
 class ToolMessage(_Msg):
-    pass
+    def __init__(self, content: Any, id: str | None = None, additional_kwargs: dict | None = None,
+                 name: str | None = None) -> None:
+        super().__init__(content, id, additional_kwargs)
+        self.name = name
 
 
 def _load(src: str, *names: str, **extra: Any) -> dict[str, Any]:
@@ -78,7 +81,8 @@ TOOL_USE = {"type": "tool_use", "id": "t1", "name": "x", "input": {}}
 
 
 def _strip() -> Any:
-    return _load(AGENT, "strip_old_thinking", "_THINKING_BLOCK_TYPES")["strip_old_thinking"]
+    return _load(AGENT, "strip_old_thinking", "_THINKING_BLOCK_TYPES",
+                 "PROMPT_CHANGING_TOOLS")["strip_old_thinking"]
 
 
 def test_old_turn_thinking_is_removed() -> None:
@@ -95,6 +99,81 @@ def test_current_turn_thinking_is_kept() -> None:
     out = _strip()(msgs)
     assert out[3] is current and out[3].content == [THINK, TOOL_USE]
     assert out[1].content == [TEXT]
+
+
+def test_thinking_before_a_memory_write_in_this_turn_is_removed() -> None:
+    # Production, 2026-09-26: "The `system` prompt differs from the one this block was
+    # created with." remember() changed the memory digest in the system prompt mid-turn.
+    before, after = AIMessage([THINK, TOOL_USE]), AIMessage([THINK, TOOL_USE])
+    msgs = [HumanMessage("q"), before, ToolMessage("saved", name="remember"), after,
+            ToolMessage("r", name="repo_read")]
+    out = _strip()(msgs)
+    assert out[1].content == [TOOL_USE], out[1].content
+    assert out[3] is after, "thinking made under the new prompt must be kept"
+
+
+def test_forget_and_escalate_also_change_the_prompt() -> None:
+    for tool in ("forget", "escalate"):
+        msgs = [HumanMessage("q"), AIMessage([THINK, TOOL_USE]), ToolMessage("ok", name=tool)]
+        assert _strip()(msgs)[1].content == [TOOL_USE], tool
+
+
+def test_ordinary_tools_keep_current_turn_thinking() -> None:
+    first = AIMessage([THINK, TOOL_USE])
+    msgs = [HumanMessage("q"), first, ToolMessage("x", name="recall"),
+            AIMessage([THINK, TOOL_USE]), ToolMessage("y", name="web_search")]
+    out = _strip()(msgs)
+    assert out[1] is first and out[3] is msgs[3]
+
+
+def test_a_prompt_changing_tool_in_an_earlier_turn_does_not_reach_this_turn() -> None:
+    current = AIMessage([THINK, TOOL_USE])
+    msgs = [HumanMessage("q1"), AIMessage([THINK, TOOL_USE]), ToolMessage("s", name="remember"),
+            AIMessage([TEXT]), HumanMessage("q2"), current]
+    assert _strip()(msgs)[5] is current
+
+
+def test_strip_all_removes_every_thinking_block() -> None:
+    msgs = [HumanMessage("q"), AIMessage([THINK, TOOL_USE]), ToolMessage("r", name="x"),
+            AIMessage([REDACTED, TEXT])]
+    out = _strip()(msgs, True)
+    assert out[1].content == [TOOL_USE] and out[3].content == [TEXT]
+
+
+def test_binding_error_is_recognised() -> None:
+    is_err = _load(AGENT, "is_thinking_binding_error")["is_thinking_binding_error"]
+    both = [
+        "Error code: 400 - messages.5.content.16: Invalid `signature` in `thinking` block. "
+        "The block is bound to a different conversation. Content before this block differs",
+        "messages.7.content.0: Invalid `signature`in`thinking`block. The block is bound to a "
+        "different conversation. ... The`system` prompt differs from the one this block was created with.",
+    ]
+    for text in both:
+        assert is_err(RuntimeError(text)), text
+    for text in ("Error code: 400 - prompt is too long", "429 rate_limit_error",
+                 "credit balance is too low", "Invalid `signature` on webhook"):
+        assert not is_err(RuntimeError(text)), text
+
+
+def test_retry_is_wired_into_ui_and_headless() -> None:
+    ui = (ROOT / "app" / "ui.py").read_text()
+    drive = ui[ui.index("async def _drive("):ui.index("async def _drive(") + 3000]
+    assert "is_thinking_binding_error(e)" in drive and "STRIP_ALL_THINKING.set(True)" in drive
+    run_turn = ui[ui.index("async def _run_turn("):]
+    assert "STRIP_ALL_THINKING.set(False)" in run_turn[:400]
+    headless = (ROOT / "app" / "headless.py").read_text()
+    assert "is_thinking_binding_error(e)" in headless
+    assert "STRIP_ALL_THINKING.set(False)" in headless
+    # The headless retry must fall through to the approval gate, never skip it.
+    retry = headless[headless.index("if is_thinking_binding_error(e)"):headless.index("else:", headless.index("if is_thinking_binding_error(e)"))]
+    assert "continue" not in retry and "break" not in retry
+
+
+def test_retry_happens_only_once_per_turn() -> None:
+    ui = (ROOT / "app" / "ui.py").read_text()
+    assert "if not is_thinking_binding_error(e) or STRIP_ALL_THINKING.get():\n                raise" in ui
+    headless = (ROOT / "app" / "headless.py").read_text()
+    assert "if is_thinking_binding_error(e) and not STRIP_ALL_THINKING.get():" in headless
 
 
 def test_messages_without_thinking_are_untouched() -> None:
