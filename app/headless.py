@@ -9,7 +9,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage
 
 from app import persistence
-from app.agent import build_graph, fallback_model_for, is_billing_error, pending_tool_calls, rejection_messages, route_model, text_of
+from app.agent import build_graph, escalation_target, fallback_model_for, is_billing_error, pending_tool_calls, recent_thread_tools, recent_user_texts, rejection_messages, route_model, text_of, thread_messages
 from app.config import settings
 from app.guards import TurnBudget, UsageMeter, calls_model_next, daily_cap_message
 from app.tools import registry
@@ -20,8 +20,7 @@ log = logging.getLogger("nikki.headless")
 async def run_prompt(prompt: str, thread_id: str, auto_approve: bool = False, model: str | None = None) -> str:
     # Scheduled and API runs get the same engineering-model routing as the chat UI. An explicit
     # `model` from the caller always wins; routing only fills in the default.
-    if model is None:
-        model = route_model(prompt)
+    explicit = model is not None
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.recursion_limit}
     # The same per-turn budget the interactive path uses. This loop is the one nobody
     # is watching -- and a schedule created through the approval gate may carry
@@ -40,6 +39,10 @@ async def run_prompt(prompt: str, thread_id: str, auto_approve: bool = False, mo
     stopped: str | None = None
     await persistence.trace(thread_id, "user", {"text": prompt, "model": model or settings.model, "headless": True})
     async with persistence.checkpointer() as cp:
+        if not explicit:
+            # A schedule that reuses its thread keeps the same stickiness as a chat thread.
+            history = await thread_messages(cp, config)
+            model = route_model(prompt, recent_thread_tools(history), recent_user_texts(history))
         graph = build_graph(cp, model)
         stale = pending_tool_calls(await graph.aget_state(config))
         if stale:
@@ -103,6 +106,7 @@ async def run_prompt(prompt: str, thread_id: str, auto_approve: bool = False, mo
                 budget.record(tc["name"], tc.get("args"))
                 await persistence.trace(thread_id, "tool_call", tc)
             gated = [tc for tc in calls if registry.requires_approval(tc["name"], tc.get("args"))]
+            rejected = bool(gated and not auto_approve)
             if gated and not auto_approve:
                 await persistence.trace(thread_id, "approval", {"approved": False, "tools": [tc["name"] for tc in gated], "reason": "headless"})
                 await graph.aupdate_state(
@@ -112,6 +116,11 @@ async def run_prompt(prompt: str, thread_id: str, auto_approve: bool = False, mo
                 )
             elif gated:
                 await persistence.trace(thread_id, "approval", {"approved": True, "tools": [tc["name"] for tc in gated], "reason": "schedule auto_approve"})
+            # `escalate` switches an automatically routed run to the engineer model, as in chat.
+            target = None if explicit or rejected else escalation_target(model, calls)
+            if target:
+                model = target
+                await persistence.trace(thread_id, "model_routed", {"to": model, "reason": "escalate", "headless": True})
             inp = None
             graph = build_graph(cp, model)
         state = await graph.aget_state(config)

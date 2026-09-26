@@ -23,6 +23,20 @@ below is a mistake that actually happened (2026-09-23/25)._
 8. **Stop at the requested scope.** Don't edit UI or unrelated modules unless asked.
 9. **A failed tool call is evidence, not a typo.** If the same call fails twice, stop and
    diagnose (missing access? output cut off? wrong assumption?) before a third attempt.
+   If it is still unclear, call `escalate` with a one-line reason: the rest of the task then
+   runs on the engineering model with deeper thinking.
+10. **Multi-turn builds keep a `BUILD_PLAN.md`** at the root of the target repo. Anything that
+   will take more than one turn gets one before the first edit:
+   - `## Goal` — what done looks like, in Stan's words where possible.
+   - `## Phases` — numbered checklist (`- [ ]` / `- [x]`), each small enough for one turn.
+   - `## Decisions` — each choice with a one-line why, so a later turn doesn't reopen it.
+   - `## Next` — the exact next step, specific enough to start cold.
+   - `## Open problems` — failures, unknowns, anything waiting on Stan.
+   `repo_read` it first in every turn on that repo, before anything else. Update it as each
+   step finishes, not at the end: a turn can stop at its step limit without warning, and the
+   plan is the only memory that survives trimmed history, reloads and model switches. Commit it
+   with the work on the branch. If you resume a build that has no plan, write one from the
+   conversation before continuing.
 
 ## Overview & Source of Truth
 

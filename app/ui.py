@@ -12,7 +12,7 @@ from chainlit.input_widget import Select
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
 from app import persistence
-from app.agent import build_graph, fallback_model_for, friendly_error, is_billing_error, pending_tool_calls, rejection_messages, route_light_model, route_model, text_of
+from app.agent import build_graph, escalation_target, fallback_model_for, friendly_error, is_billing_error, pending_tool_calls, recent_thread_tools, recent_user_texts, rejection_messages, route_light_model, route_model, text_of, thread_messages
 from app.guards import TurnBudget, UsageMeter, calls_model_next, daily_cap_message
 from app.tools.artifacts import FILE_MARK, marks_in
 from app.tools.images import IMAGE_MARK
@@ -324,11 +324,6 @@ class TurnRenderer:
         await step.send()
         self.steps[tc["id"]] = step
         await persistence.trace(self.thread_id, "tool_call", tc)
-        # Remembered so route_model can upgrade a later turn on this thread that started as
-        # ordinary conversation and drifted into engineering work.
-        seen = cl.user_session.get("recent_tools") or set()
-        seen.add(tc["name"])
-        cl.user_session.set("recent_tools", seen)
 
     async def show_image(self, out: str) -> None:
         """Render an image a tool saved in the workspace inline in the chat."""
@@ -412,8 +407,12 @@ async def on_message(message: cl.Message) -> None:
         _turn_locks.pop(thread_id, None)
 
 
-async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "TurnRenderer", thread_id: str, preapproved: bool | None = None) -> None:
-    """Run one turn until complete or until an approval checkpoint is rendered."""
+async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "TurnRenderer", thread_id: str, preapproved: bool | None = None) -> str:
+    """Run one turn until complete or until an approval checkpoint is rendered.
+
+    Returns the model the turn ended on, which differs from `model` when the model
+    called `escalate` part-way through.
+    """
     while True:
         if await calls_model_next(graph, config, inp):
             r.budget.start_round()
@@ -439,7 +438,7 @@ async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "Tu
             })
             await cl.Message(content=stop).send()
             _turn_budgets.pop(thread_id, None)
-            return
+            return model
 
         calls = pending_tool_calls(state)
 
@@ -470,14 +469,17 @@ async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "Tu
         for tc in calls:
             r.budget.record(tc["name"], tc.get("args"))
 
+        rejected = False  # a rejected batch rejects its `escalate` call too: don't switch
+
         gated = [tc for tc in calls if registry.requires_approval(tc["name"], tc.get("args"))]
         if gated:
             if preapproved is None:
                 await ask_approval(thread_id, gated)
-                return
+                return model
             else:
                 approved, preapproved = preapproved, None
             await persistence.trace(thread_id, "approval", {"approved": approved, "tools": [tc["name"] for tc in gated]})
+            rejected = not approved
             if not approved:
                 for tc in calls:
                     step = r.steps.pop(tc["id"], None)
@@ -486,10 +488,18 @@ async def _drive(graph: Any, cp: Any, model: str, config: dict, inp: Any, r: "Tu
                         step.is_error = True
                         await step.update()
                 await graph.aupdate_state(config, {"messages": rejection_messages(calls)}, as_node="tools")
+        # The model asked for the stronger model (the `escalate` tool). Switch before the
+        # rebuild below, so the model call that reads the tool's result is already on it.
+        target = None if rejected else escalation_target(model, calls)
+        if target:
+            model = target
+            await persistence.trace(thread_id, "model_routed", {"to": model, "reason": "escalate"})
+            await cl.Message(content=f"↗️ Switching to `{model.partition(':')[2] or model}` with deeper thinking for the rest of this task.").send()
         # resume from the interrupt; rebuild so hot-loaded skills are bound to the model
         inp = None
         graph = build_graph(cp, model)
     _turn_budgets.pop(thread_id, None)  # turn finished normally
+    return model
 
 
 async def _continue_approval(thread_id: str, approved: bool, approval_id: str | None = None) -> bool:
@@ -527,6 +537,18 @@ async def _continue_approval(thread_id: str, approved: bool, approval_id: str | 
                     await cl.Message(content=messages.get(claim, "That approval is no longer pending.")).send()
                     return True
                 async with persistence.checkpointer() as cp:
+                    # Resume on the model the turn was routed to, not the chat default.
+                    # Every push and deploy passes through here, and without this the rest
+                    # of an engineering turn - reading the build log, fixing a failure -
+                    # silently dropped from the engineer model to NIKKI_MODEL. The pending
+                    # calls are in the thread's history, so a gated repo_commit_push or an
+                    # earlier `escalate` routes this resume exactly like its turn.
+                    if model == settings.model:
+                        history = await thread_messages(cp, config)
+                        routed = route_model("", recent_thread_tools(history), recent_user_texts(history))
+                        if routed:
+                            model = routed
+                            await persistence.trace(thread_id, "model_routed", {"to": routed, "reason": "approval_resume"})
                     graph = build_graph(cp, model)
                     calls = pending_tool_calls(await graph.aget_state(config))
                     gated = [tc for tc in calls if registry.requires_approval(tc["name"], tc.get("args"))]
@@ -608,20 +630,24 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
     if message.elements:
         user_content = await asyncio.to_thread(ingest_uploads, message.content, message.elements)
 
-    # Route engineering turns to a stronger model, unless the user picked one
-    # explicitly in the chat settings panel (an explicit choice always wins).
-    routed = route_model(message.content, cl.user_session.get("recent_tools"))
-    if routed and (cl.user_session.get("model") or settings.model) == settings.model:
-        model = routed
-        await persistence.trace(thread_id, "model_routed", {"to": routed})
-    elif not routed and (cl.user_session.get("model") or settings.model) == settings.model:
-        light = route_light_model(message.content, cl.user_session.get("recent_tools"), bool(message.elements))
-        if light:
-            model = light
-            await persistence.trace(thread_id, "model_routed", {"to": light, "reason": "light"})
-
     try:
         async with persistence.checkpointer() as cp:
+            # Route engineering turns to a stronger model, unless the user picked one
+            # explicitly in the chat settings panel (an explicit choice always wins).
+            # Recent tool use is read from this thread's own history, so it survives a
+            # page reload and fades after a few turns of ordinary conversation.
+            if model == settings.model:
+                history = await thread_messages(cp, config)
+                recent = recent_thread_tools(history)
+                routed = route_model(message.content, recent, recent_user_texts(history))
+                if routed:
+                    model = routed
+                    await persistence.trace(thread_id, "model_routed", {"to": routed})
+                else:
+                    light = route_light_model(message.content, recent, bool(message.elements))
+                    if light:
+                        model = light
+                        await persistence.trace(thread_id, "model_routed", {"to": light, "reason": "light"})
             graph = build_graph(cp, model)
             approval_state = await persistence.supersede_pending_approval(
                 thread_id, principal.tenant_id, principal.email
@@ -640,7 +666,7 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
                 await graph.aupdate_state(config, {"messages": rejection_messages(stale, "Superseded by a new user message.")}, as_node="tools")
                 graph = build_graph(cp, model)
             try:
-                await _drive(graph, cp, model, config, inp, r, thread_id)
+                model = await _drive(graph, cp, model, config, inp, r, thread_id)
             except Exception as e:  # noqa: BLE001
                 fb = fallback_model_for(model)
                 if not (fb and is_billing_error(e)):
@@ -654,7 +680,7 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
                 graph = build_graph(cp, fb)
                 state = await graph.aget_state(config)
                 # If the failed call had already checkpointed the user message, resume; else replay it.
-                await _drive(graph, cp, fb, config, None if state.next else inp, r, thread_id)
+                model = await _drive(graph, cp, fb, config, None if state.next else inp, r, thread_id)
     except Exception as e:  # noqa: BLE001
         log.exception("turn failed")
         await r.close_segment()
