@@ -573,6 +573,34 @@ def repair_history(messages: list[Any]) -> list[Any]:
     return out
 
 
+_THINKING_BLOCK_TYPES = ("thinking", "redacted_thinking")
+
+
+def strip_old_thinking(messages: list[Any]) -> list[Any]:
+    """Remove thinking blocks from assistant messages *before* the latest user message.
+
+    The API binds every thinking block's signature to the exact conversation that preceded
+    it. Nikki deliberately rewrites earlier history before each call (trim_history,
+    compact_old_tool_results, time stamps), so an old thinking block no longer matches
+    what now precedes it and the request fails with 400 "Invalid `signature` in
+    `thinking` block. The block is bound to a different conversation." Thinking from
+    finished turns is not used by the model anyway - the API ignores it - so dropping it
+    loses nothing. Thinking inside the current turn (after the latest user message) is
+    kept: the API requires it to continue a tool-use loop, and nothing before it changes.
+    Non-destructive copy; the stored checkpoint is untouched.
+    """
+    last_human = max((i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=-1)
+    out: list[Any] = []
+    for i, m in enumerate(messages):
+        if i < last_human and isinstance(m, AIMessage) and isinstance(m.content, list):
+            kept = [b for b in m.content
+                    if not (isinstance(b, dict) and b.get("type") in _THINKING_BLOCK_TYPES)]
+            if len(kept) != len(m.content):
+                m = m.model_copy(update={"content": kept})
+        out.append(m)
+    return out
+
+
 def _approx_tokens(m: Any) -> int:
     """Cheap token estimate (~4 chars/token) covering text content and tool-call arguments."""
     n = len(text_of(m.content))
@@ -661,6 +689,19 @@ def mark_cache_breakpoint(messages: list[Any]) -> list[Any]:
 
 
 _STAMPS: dict[str, str] = {}
+STAMP_KWARG = "nikki_time_stamp"
+
+
+def time_stamp() -> str:
+    """The clock line put in front of a user message (see stamp_latest_user_message)."""
+    from datetime import datetime, timezone
+
+    return f"[Current time: {datetime.now(timezone.utc):%A %Y-%m-%d %H:%M} UTC]"
+
+
+def new_user_message(content: Any) -> HumanMessage:
+    """A HumanMessage carrying its own time stamp, so every instance renders it the same."""
+    return HumanMessage(content=content, additional_kwargs={STAMP_KWARG: time_stamp()})
 
 
 def stamp_latest_user_message(messages: list[Any]) -> list[Any]:
@@ -673,8 +714,6 @@ def stamp_latest_user_message(messages: list[Any]) -> list[Any]:
     rounds, approvals and later turns. Older messages this process never stamped (e.g.
     after a restart) are left alone rather than given a made-up time.
     """
-    from datetime import datetime, timezone
-
     last = next((i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], HumanMessage)), None)
     if last is None:
         return messages
@@ -683,11 +722,18 @@ def stamp_latest_user_message(messages: list[Any]) -> list[Any]:
         if not isinstance(m, HumanMessage):
             continue
         key = getattr(m, "id", None)
-        stamp = _STAMPS.get(key) if key else None
+        # A stamp stored on the message itself (see new_user_message) is identical on
+        # every instance and after restarts. The in-process memo only covers messages
+        # created before that existed. A stamp that changed between two calls of the same
+        # turn (e.g. an approval resumed on another Cloud Run instance) would also break
+        # the thinking-block signatures of that turn, not just the cache.
+        stamp = (getattr(m, "additional_kwargs", None) or {}).get(STAMP_KWARG)
+        if stamp is None and key:
+            stamp = _STAMPS.get(key)
         if stamp is None and i == last:
             if len(_STAMPS) > 20000:
                 _STAMPS.clear()
-            stamp = f"[Current time: {datetime.now(timezone.utc):%A %Y-%m-%d %H:%M} UTC]"
+            stamp = time_stamp()
             if key:
                 _STAMPS[key] = stamp
         if stamp is None:
@@ -705,7 +751,8 @@ def stamp_latest_user_message(messages: list[Any]) -> list[Any]:
 
 def _prepare_messages(msgs: list[Any], anthropic: bool) -> list[Any]:
     budget = settings.history_budget_tokens_anthropic if anthropic else settings.history_budget_tokens
-    out = stamp_latest_user_message(compact_old_tool_results(trim_history(repair_history(list(msgs)), budget)))
+    out = stamp_latest_user_message(compact_old_tool_results(
+        trim_history(repair_history(strip_old_thinking(list(msgs))), budget)))
     return mark_cache_breakpoint(out) if anthropic else out
 
 

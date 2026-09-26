@@ -9,10 +9,10 @@ from typing import Any
 
 import chainlit as cl
 from chainlit.input_widget import Select
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 
 from app import persistence
-from app.agent import build_graph, escalation_target, fallback_model_for, friendly_error, is_billing_error, pending_tool_calls, recent_thread_tools, recent_user_texts, rejection_messages, route_light_model, route_model, text_of, thread_messages
+from app.agent import build_graph, escalation_target, fallback_model_for, friendly_error, is_billing_error, new_user_message, pending_tool_calls, recent_thread_tools, recent_user_texts, rejection_messages, route_light_model, route_model, text_of, thread_messages
 from app.guards import TurnBudget, UsageMeter, calls_model_next, daily_cap_message
 from app.tools.artifacts import FILE_MARK, marks_in
 from app.tools.images import IMAGE_MARK
@@ -659,7 +659,7 @@ async def _run_turn(message: cl.Message, thread_id: str) -> None:
                 return
             _pending_approvals.discard(thread_id)
             stale = pending_tool_calls(await graph.aget_state(config))
-            inp: Any = {"messages": [HumanMessage(content=user_content)]}
+            inp: Any = {"messages": [new_user_message(user_content)]}
             if stale:
                 # A non-approval message supersedes an orphaned checkpoint. This prevents
                 # a stale action from ever being executed after the user changes direction.
