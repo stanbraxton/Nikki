@@ -87,7 +87,14 @@ Tool functions must **return errors as text**, never raise. A raised exception i
     --format='value(spec.template.spec.containers[0].image)'
   ```
 
-- **Env vars on the service override `app/config.py` defaults — check before assuming a config change is live.** `scripts/deploy.sh` sets `NIKKI_MODEL` explicitly in `--set-env-vars`, so `config.py`'s `_env("NIKKI_MODEL", ...)` default is inert in production: the live service decides. This bit once already — the script's default sat at `claude-sonnet-4-5` for a full generation after the code default moved on (fixed 2026-09-21; **if you change one, change both**). `NIKKI_ENGINEER_MODEL` and `NIKKI_THINKING_BUDGET_TOKENS` are *not* set on the service, so those *do* follow the code default — meaning one deploy can land half-applied: the settings with no env var activate silently while the one that has an env var does not move. Read the live values before concluding a model change shipped:
+- **Env vars on the service override `app/config.py` defaults — check before assuming a config change is live.** `scripts/deploy.sh` sets `NIKKI_MODEL` explicitly in `--set-env-vars`, so `config.py`'s `_env("NIKKI_MODEL", ...)` default is inert in production: the live service decides. This bit once already — the script's default sat at `claude-sonnet-4-5` for a full generation after the code default moved on (fixed 2026-09-21; **if you change one, change both**). **This paragraph used to say `NIKKI_ENGINEER_MODEL` and `NIKKI_THINKING_BUDGET_TOKENS` were not set on the service. They were.** The 09-21 cost freeze pinned four settings there, and they silently overrode every reasoning upgrade merged afterwards:
+
+  - `NIKKI_ENGINEER_MODEL` was pinned to Sonnet 4.5, so no engineering turn ever reached Opus.
+  - `NIKKI_THINKING_BUDGET_TOKENS=0`, so thinking was off entirely.
+  - `NIKKI_MAX_TOKENS=4096` truncated large `repo_write` calls, the same failure as the 8192 incident.
+  - `NIKKI_OLD_TOOL_RESULT_CHARS=1500`.
+
+  All four were removed on 2026-09-26 (revision `nikki-00096-c8p`), so the code defaults apply. Only `NIKKI_MODEL` is still set on the service. **Don't pin a tuning value on the service to test it.** Change the code default in a reviewed commit instead. If you do pin one, add it to this list, because a pin is invisible from the code. Either way, one deploy can land half-applied: settings with no env var follow the code, while pinned ones don't move. Read the live values before concluding a model change shipped:
 
   ```bash
   gcloud run services describe nikki --region us-east4 --project nikkiaia-prod \
