@@ -53,9 +53,11 @@ def _load(*names: str) -> dict[str, Any]:
     tree = ast.parse(SRC)
     ns: dict[str, Any] = {
         "Any": Any, "HumanMessage": HumanMessage, "AIMessage": AIMessage, "ToolMessage": ToolMessage,
-        "log": logging.getLogger("test"), "_STAMPS": {},
+        "log": logging.getLogger("test"), "_STAMPS": {}, "STAMP_KWARG": "nikki_time_stamp",
         "settings": types.SimpleNamespace(history_budget_tokens=1000),
     }
+    if "stamp_latest_user_message" in names:
+        names = (*names, "time_stamp")  # the stamp text now comes from time_stamp()
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in names:
             exec(compile(ast.Module([node], []), "agent.py", "exec"), ns)

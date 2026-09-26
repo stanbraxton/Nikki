@@ -6,10 +6,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage
 
 from app import persistence
-from app.agent import build_graph, escalation_target, fallback_model_for, is_billing_error, pending_tool_calls, recent_thread_tools, recent_user_texts, rejection_messages, route_model, text_of, thread_messages
+from app.agent import build_graph, escalation_target, fallback_model_for, is_billing_error, new_user_message, pending_tool_calls, recent_thread_tools, recent_user_texts, rejection_messages, route_model, text_of, thread_messages
 from app.config import settings
 from app.guards import TurnBudget, UsageMeter, calls_model_next, daily_cap_message
 from app.tools import registry
@@ -47,7 +47,7 @@ async def run_prompt(prompt: str, thread_id: str, auto_approve: bool = False, mo
         stale = pending_tool_calls(await graph.aget_state(config))
         if stale:
             await graph.aupdate_state(config, {"messages": rejection_messages(stale, "Superseded by a new run.")}, as_node="tools")
-        inp: Any = {"messages": [HumanMessage(content=prompt)]}
+        inp: Any = {"messages": [new_user_message(prompt)]}
         while True:
             if await calls_model_next(graph, config, inp):
                 budget.start_round()

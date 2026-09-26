@@ -54,6 +54,29 @@ def _cfg(name: str, default: str | None = None) -> str | None:
     return v if v is not None and v.strip() else default
 
 
+# Apps whose deploys, settings and code are owned outside Nikki. SmartTutor moved to
+# Claude on 2026-09-26: GitHub Actions deploys it on every merge to main, so a
+# deploy_app from Nikki's clone could put older code live over newer work.
+# Read-only tools (app_status, list_apps, repo_read ...) still work for these.
+# Override with NIKKI_EXTERNAL_APPS="slug-a,slug-b" (empty string keeps the default).
+_DEFAULT_EXTERNAL_APPS = "smarttutor-ai"
+
+
+def external_apps() -> set[str]:
+    raw = _cfg("NIKKI_EXTERNAL_APPS", _DEFAULT_EXTERNAL_APPS) or ""
+    return {part.strip().lower() for part in raw.split(",") if part.strip()}
+
+
+def _external_refusal(name: str) -> str | None:
+    """Refusal text when `name` (an app slug or an owner/repo) is managed outside Nikki."""
+    key = (name or "").strip().lower().rstrip("/").removesuffix(".git").rsplit("/", 1)[-1]
+    if key and key in external_apps():
+        return (f"refused: {key} is managed outside Nikki. Claude builds it and GitHub Actions "
+                "deploys it automatically when Stan merges to main. Do not deploy, push to, "
+                "change settings of, or delete it. Tell Stan to ask Claude instead.")
+    return None
+
+
 def repos_dir() -> Path:
     p = Path(_cfg("ENGINEER_REPOS_DIR", "/tmp/repos"))  # type: ignore[arg-type]
     p.mkdir(parents=True, exist_ok=True)
@@ -496,6 +519,9 @@ def repo_commit_push(repo: str, message: str, branch: str = "", force: bool = Fa
     and must be justified out loud. Then a stronger reviewer model reads the staged diff; if it reports
     blocking defects the push is refused - fix them and push again. `override_review=True` pushes anyway
     and must be justified out loud to the user (e.g. the finding is demonstrably wrong)."""
+    refused = _external_refusal(repo)
+    if refused:
+        return refused
     try:
         path = _repo_dir(repo)
         if not github_token():
@@ -976,6 +1002,9 @@ def deploy_app(slug: str) -> str:
     immediately; the build takes 3-8 minutes. When started from a chat, the result (success + URL, or the
     build errors) is posted into this conversation automatically when it finishes — so don't poll: tell the
     user it's queued and that the result will appear here, then end your turn."""
+    refused = _external_refusal(slug)
+    if refused:
+        return refused
     slug = slug.strip().lower()
     app = _app(slug)
     if not app:
@@ -1044,6 +1073,9 @@ def list_apps() -> str:
 def add_custom_domain(slug: str, domain: str) -> str:
     """Attach a custom domain (e.g. app.example.com) to a registered app's Firebase Hosting site. Requires approval.
     Returns the DNS records the domain owner must create; the certificate is issued automatically once they resolve."""
+    refused = _external_refusal(slug)
+    if refused:
+        return refused
     app = _app(slug.strip().lower())
     if not app:
         return "not found"
@@ -1076,6 +1108,9 @@ def add_custom_domain(slug: str, domain: str) -> str:
 def delete_app(slug: str, delete_hosting_site: bool = False) -> str:
     """Remove an app from the registry (optionally deleting its Firebase Hosting site). The GitHub repo and
     Convex project are never touched. Requires approval."""
+    refused = _external_refusal(slug)
+    if refused:
+        return refused
     app = _app(slug.strip().lower())
     if not app:
         return "not found"
@@ -1292,6 +1327,9 @@ def set_convex_env(slug: str, name: str, value: str) -> str:
     """Set (or clear with value='') a Convex production environment variable for a registered app — API keys,
     SITE_URL, EMAIL_FROM, etc. Requires approval. Values are stored in Secret Manager and applied on the next
     deploy_app (Cloud Build runs `convex env set` before deploying). Never echo secret values back."""
+    refused = _external_refusal(slug)
+    if refused:
+        return refused
     slug = slug.strip().lower()
     name = name.strip()
     if not _app(slug):
