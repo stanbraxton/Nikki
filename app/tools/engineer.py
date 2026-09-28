@@ -55,11 +55,11 @@ def _cfg(name: str, default: str | None = None) -> str | None:
 
 
 # Apps whose deploys, settings and code are owned outside Nikki. SmartTutor moved to
-# Claude on 2026-09-26: GitHub Actions deploys it on every merge to main, so a
-# deploy_app from Nikki's clone could put older code live over newer work.
+# Claude on 2026-09-26, Golden Market on 2026-09-28: GitHub Actions deploys each on every
+# merge to main, so a deploy_app from Nikki's clone could put older code live over newer work.
 # Read-only tools (app_status, list_apps, repo_read ...) still work for these.
 # Override with NIKKI_EXTERNAL_APPS="slug-a,slug-b" (empty string keeps the default).
-_DEFAULT_EXTERNAL_APPS = "smarttutor-ai"
+_DEFAULT_EXTERNAL_APPS = "smarttutor-ai,golden-market"
 
 
 def external_apps() -> set[str]:

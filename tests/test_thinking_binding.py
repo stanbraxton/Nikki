@@ -239,10 +239,17 @@ def test_smarttutor_is_refused_by_slug_and_repo() -> None:
         assert refuse(name) and "refused" in refuse(name), name
 
 
+def test_golden_market_is_refused_by_slug_and_repo() -> None:
+    refuse = _guard()
+    for name in ("golden-market", "Golden-Market", "stanbraxton/golden-market",
+                 "https://github.com/stanbraxton/golden-market.git"):
+        assert refuse(name) and "refused" in refuse(name), name
+
+
 def test_other_apps_are_not_refused() -> None:
     refuse = _guard()
     for name in ("golden-picks", "stanbraxton/golden-picks", "stanbraxton/Nikki",
-                 "smarttutor", "ai-tutor-platform", ""):
+                 "smarttutor", "ai-tutor-platform", "golden", "golden-marketing", ""):
         assert refuse(name) is None, name
 
 

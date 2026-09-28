@@ -5,7 +5,7 @@ Golden Market is Stan Braxton's quantitative options and earnings signals web ap
 ## Architecture & Hosting
 
 - **Tech Stack:** React/Vite + Convex web app.
-- **Hosting:** Currently hosted on the legacy hosting platform (prod and preview environments active), slated for migration to Stan's own GitHub + Firebase Hosting + Convex account [2026-08-29]. Research and credentials reside in `projects/golden-market/`.
+- **Hosting & ownership:** Claude develops Golden Market as of 2026-09-28. Code lives in GitHub `stanbraxton/golden-market`; GitHub Actions deploys the Convex backend and Firebase Hosting site `goldenmarket-signals` (project `nikkiaia-prod`) on every merge to main. Nikki's deploy/push/settings tools refuse this app; read-only tools still work. If Stan asks Nikki to change it, tell him to ask Claude. Research and credentials reside in `projects/golden-market/`.
 - **Authentication & Access:** Authenticated template default with `workspace_members` access gate.
 - **Database & Seeding:** Convex DB with self-seeding (`backtestSeed.seed`) running inside refresh, `ensureFresh`, and scheduled job routines. Manual `bunx convex run` targets DEV unless production seeding is explicitly done through app-specific paths.
 - **Scheduled Jobs & Refresh:** Scheduled job refresh runs every 30 minutes, skipping ET 22:00-07:00; client `ensureFresh` gates refresh to a 15-minute interval.
@@ -69,5 +69,4 @@ Golden Market is Stan Braxton's quantitative options and earnings signals web ap
 
 ## Open Items
 
-- Migrate the application from the legacy hosting platform to Stan's own GitHub + Firebase Hosting + Convex account.
 - Cancel Massive Options Advanced before renewal due to lack of verified edge in the options flow layer.
