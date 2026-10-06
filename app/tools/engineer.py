@@ -55,11 +55,12 @@ def _cfg(name: str, default: str | None = None) -> str | None:
 
 
 # Apps whose deploys, settings and code are owned outside Nikki. SmartTutor moved to
-# Claude on 2026-09-26, Golden Market on 2026-09-28: GitHub Actions deploys each on every
-# merge to main, so a deploy_app from Nikki's clone could put older code live over newer work.
+# Claude on 2026-09-26, Golden Market on 2026-09-28, WellCollar on 2026-10-02 (Stan: "Nikki
+# does not handle WellCollar"). Claude deploys each, so a deploy_app from Nikki's clone could put
+# older code live over newer work.
 # Read-only tools (app_status, list_apps, repo_read ...) still work for these.
 # Override with NIKKI_EXTERNAL_APPS="slug-a,slug-b" (empty string keeps the default).
-_DEFAULT_EXTERNAL_APPS = "smarttutor-ai,golden-market"
+_DEFAULT_EXTERNAL_APPS = "smarttutor-ai,golden-market,wellcollar"
 
 
 def external_apps() -> set[str]:
@@ -71,8 +72,8 @@ def _external_refusal(name: str) -> str | None:
     """Refusal text when `name` (an app slug or an owner/repo) is managed outside Nikki."""
     key = (name or "").strip().lower().rstrip("/").removesuffix(".git").rsplit("/", 1)[-1]
     if key and key in external_apps():
-        return (f"refused: {key} is managed outside Nikki. Claude builds it and GitHub Actions "
-                "deploys it automatically when Stan merges to main. Do not deploy, push to, "
+        return (f"refused: {key} is managed outside Nikki. Claude builds and deploys it. "
+                "Do not deploy, push to, "
                 "change settings of, or delete it. Tell Stan to ask Claude instead.")
     return None
 
